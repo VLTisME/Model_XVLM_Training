@@ -1,0 +1,121 @@
+"""Typed configuration: YAML -> dataclasses, with safe overrides.
+
+Keeping config typed (instead of raw dicts) catches typos early and documents every knob.
+"""
+from __future__ import annotations
+
+import dataclasses
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+@dataclass
+class DataConfig:
+    manifest: str = "manifests/star_v3.parquet"
+    image_root: str = "data/pab"
+    image_size: int = 384
+    max_token: int = 100
+    # LHP augmentation
+    lhp_enabled: bool = False
+    lhp_min_scale: float = 0.5
+    lhp_use_bbox: bool = True
+    # smart sampler
+    group_by: str = "scene"          # "scene" | "action" | "none"
+    group_fraction: float = 0.5       # fraction of batch drawn from one group
+    num_workers: int = 8
+
+
+@dataclass
+class ModelConfig:
+    backbone: str = "xvlm"            # "xvlm" | "dummy"
+    checkpoint: str | None = None     # path to X-VLM / CMP weights
+    embed_dim: int = 256
+    # LoRA
+    lora_enabled: bool = True
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_targets: tuple[str, ...] = ("query", "value")
+    lora_freeze_text: bool = True     # PLAN: text encoder FROZEN (no LoRA) — adapt image+cross only
+    # pose branch (toggle) — fused into the IMAGE-encoder branch, no separate pose loss
+    pose_enabled: bool = False
+    pose_hidden: int = 256
+
+
+@dataclass
+class LossConfig:
+    # PLAN total loss:  L = ITC + lambda_itm * ITM + lambda_smooth_ap * Smooth-AP   (MLM removed)
+    w_itc: float = 1.0                # ITC coefficient (fixed at 1.0 in the plan)
+    lambda_itm: float = 1.0           # λ1
+    lambda_smooth_ap: float = 0.3     # λ2
+    itc_temp_init: float = 0.07
+    smooth_ap_temp: float = 0.01
+
+
+@dataclass
+class OptimConfig:
+    lr_lora: float = 2e-4
+    lr_head: float = 4e-4
+    weight_decay: float = 0.02
+    betas: tuple[float, float] = (0.9, 0.999)   # matches X-VLM/ALBEF AdamW (unmodified default)
+    eps: float = 1e-8
+    grad_clip: float = 1.0
+    warmup_epochs: float = 1.0
+    epochs: int = 8
+
+
+@dataclass
+class TrainConfig:
+    batch_size: int = 24
+    grad_accum: int = 4
+    amp_dtype: str = "bf16"           # "bf16" | "fp16" | "fp32"
+    grad_checkpointing: bool = True
+    eval_every_epochs: float = 0.5
+    early_stop_patience: int = 2
+    seed: int = 42
+    out_dir: str = "outputs/star_v3"
+    log_wandb: bool = False
+
+
+@dataclass
+class Config:
+    data: DataConfig = field(default_factory=DataConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
+    loss: LossConfig = field(default_factory=LossConfig)
+    optim: OptimConfig = field(default_factory=OptimConfig)
+    train: TrainConfig = field(default_factory=TrainConfig)
+
+
+# ----------------------------------------------------------------------------- helpers
+def _merge(dc: Any, overrides: dict[str, Any]) -> Any:
+    """Recursively apply a (possibly nested) dict onto a dataclass instance."""
+    if not dataclasses.is_dataclass(dc):
+        return overrides
+    for k, v in overrides.items():
+        if not hasattr(dc, k):
+            raise KeyError(f"Unknown config key '{k}' for {type(dc).__name__}")
+        cur = getattr(dc, k)
+        if dataclasses.is_dataclass(cur) and isinstance(v, dict):
+            _merge(cur, v)
+        elif isinstance(cur, tuple) and isinstance(v, list):
+            setattr(dc, k, tuple(v))
+        else:
+            setattr(dc, k, v)
+    return dc
+
+
+def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Config:
+    """Load a YAML file into a typed Config; optional CLI overrides on top."""
+    cfg = Config()
+    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    _merge(cfg, raw)
+    if overrides:
+        _merge(cfg, overrides)
+    return cfg
+
+
+def to_dict(cfg: Config) -> dict[str, Any]:
+    return dataclasses.asdict(cfg)

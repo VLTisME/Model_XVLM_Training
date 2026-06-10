@@ -1,0 +1,30 @@
+# Core DL
+torch>=2.1.0
+torchvision>=0.16.0
+transformers>=4.38.0
+timm>=0.9.12
+einops>=0.7.0
+
+# Data
+numpy>=1.24
+pandas>=2.0
+pyarrow>=14.0          # parquet manifest
+Pillow>=10.0
+opencv-python>=4.8     # webp decode, bbox ops
+ftfy>=6.1              # caption cleaning
+regex>=2023.0
+
+# Config / logging / utils
+PyYAML>=6.0
+tqdm>=4.66
+scikit-learn>=1.3      # sanity metrics cross-check
+rich>=13.0             # pretty logging
+
+# Optional
+wandb>=0.16            # experiment tracking (optional, guarded import)
+peft>=0.9              # optional LoRA backend (we also ship a self-contained one)
+POT>=0.9               # optional, Sinkhorn for inference post-process
+
+# Test / quality
+pytest>=7.4
+pytest-cov>=4.1

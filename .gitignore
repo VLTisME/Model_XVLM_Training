@@ -1,0 +1,36 @@
+# data & artifacts
+data/
+manifests/
+checkpoints/
+outputs/
+runs/
+wandb/
+*.webp
+*.jpg
+*.png
+*.parquet
+*.pth
+*.pt
+*.ckpt
+*.th
+
+# X-VLM (cloned source + pinned venv; reproduce via README §5)
+third_party/X-VLM/
+.venv-xvlm/
+.venv/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.env
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# os/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

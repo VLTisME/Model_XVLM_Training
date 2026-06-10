@@ -1,0 +1,58 @@
+# STAR-v3 main config (≈100K curated PAB pairs). See README.md + analyze.md.
+# Tags: values marked INFERRED must be swept/verified on VAL-B.
+
+data:
+  manifest: manifests/star_v3.parquet
+  image_root: data/pab
+  image_size: 384
+  max_token: 100
+  lhp_enabled: false          # toggle — gain on PAB tiny (+0.18%/0%), verify VAL-B
+  lhp_min_scale: 0.5
+  lhp_use_bbox: true
+  group_by: scene             # smart sampler grouping: scene | action | none
+  group_fraction: 0.5
+  num_workers: 8
+
+model:
+  backbone: xvlm              # falls back to the dummy backbone if checkpoint is null
+  checkpoint: null            # real run (pinned venv): data/checkpoints/xvlm_16m_base.th  (see README §5)
+  embed_dim: 256
+  lora_enabled: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_targets: [query, value]
+  lora_freeze_text: true      # PLAN: text encoder FROZEN (adapt image + cross only)
+  pose_enabled: false         # toggle — fused into image branch, no separate loss
+  pose_hidden: 256
+
+loss:                         # PLAN:  L = w_itc*ITC + lambda_itm*ITM + lambda_smooth_ap*SmoothAP
+  w_itc: 1.0
+  lambda_itm: 1.0             # λ1
+  lambda_smooth_ap: 0.3       # λ2 — INFERRED, sweep {0.1, 0.3, 1.0}
+  itc_temp_init: 0.07
+  smooth_ap_temp: 0.01
+
+# NOTE: XBM removed (review fix #4). ITC negatives = in-batch + all_gather across GPUs (X-VLM
+# regime). On a single GPU, raise batch_size for more contrastive negatives.
+
+optim:
+  lr_lora: 2.0e-4             # INFERRED — sweep {5e-5, 1e-4, 2e-4, 5e-4} FIRST
+  lr_head: 4.0e-4
+  weight_decay: 0.02
+  betas: [0.9, 0.999]        # matches X-VLM/ALBEF AdamW default
+  eps: 1.0e-8
+  grad_clip: 1.0
+  warmup_epochs: 1.0
+  epochs: 8
+
+train:
+  batch_size: 24
+  grad_accum: 4              # effective batch 96 here; raise via more GPUs/all-gather
+  amp_dtype: bf16           # use fp16 on RTX 3090
+  grad_checkpointing: true
+  eval_every_epochs: 0.5
+  early_stop_patience: 2
+  seed: 42
+  out_dir: outputs/star_v3
+  log_wandb: false

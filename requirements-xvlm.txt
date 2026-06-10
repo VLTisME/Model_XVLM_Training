@@ -1,0 +1,22 @@
+# Pinned deps to run the REAL X-VLM backbone (transformers 4.12.5 era) on Python 3.11.
+# Install into a SEPARATE venv (.venv-xvlm) — see README §5 for the full recipe.
+# NOTE: torch/torchvision and the two --no-deps packages are installed separately (README §5);
+#       transformers==4.12.5 and timm==0.4.9 go in with --no-deps so the unbuildable old
+#       `tokenizers` is skipped (X-VLM uses its own pure-Python tokenizer).
+
+numpy<2
+scipy==1.11.4              # <1.14 keeps scipy.interp2d (X-VLM Swin rel-pos interpolation needs it)
+Pillow
+pandas                    # dataset manifest
+pyarrow                   # parquet manifest
+huggingface_hub==0.10.1   # API expected by transformers 4.12.5
+tokenizers>=0.13,<0.14    # modern prebuilt wheel (cp311); not exercised by X-VLM's slow tokenizer
+regex
+requests
+filelock
+sacremoses
+packaging
+ruamel.yaml
+PyYAML
+tqdm
+six                       # some X-VLM utils
