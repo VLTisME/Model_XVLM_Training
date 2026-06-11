@@ -119,3 +119,22 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Co
 
 def to_dict(cfg: Config) -> dict[str, Any]:
     return dataclasses.asdict(cfg)
+
+
+def parse_overrides(pairs: list[str]) -> dict[str, Any]:
+    """Parse CLI `--set a.b=1 c=foo` pairs into a nested dict (shared by train/evaluate)."""
+    import ast
+
+    out: dict[str, Any] = {}
+    for pair in pairs:
+        key, _, val = pair.partition("=")
+        node = out
+        parts = key.split(".")
+        for p in parts[:-1]:
+            node = node.setdefault(p, {})
+        try:
+            val = ast.literal_eval(val)
+        except (ValueError, SyntaxError):
+            pass
+        node[parts[-1]] = val
+    return out

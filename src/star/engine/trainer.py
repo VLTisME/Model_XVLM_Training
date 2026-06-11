@@ -59,12 +59,20 @@ class Trainer:
     def overfit_one_batch(self, max_steps: int = 300, target: float = 0.05) -> float:
         batch = self._to_device(next(iter(self.train_loader)))
         self.model.train()
+        # BUGFIX: the warmup scheduler initializes every group's LR to lr_lambda(0)=0, and this
+        # loop never steps the scheduler -> the check would run at LR=0 and learn nothing.
+        # A wiring check wants a constant healthy LR, independent of the schedule:
+        for g in self.optimizer.param_groups:
+            g["lr"] = 1e-3
+        initial = None
         for i in range(max_steps):
             self.optimizer.zero_grad(set_to_none=True)
             out = self._forward_loss(batch)
             loss = out["loss"]
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"NaN/Inf loss at step {i}: {out}")
+            if initial is None:
+                initial = loss.item()
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.optim.grad_clip)
@@ -72,10 +80,14 @@ class Trainer:
             self.scaler.update()
             if i % 25 == 0:
                 log.info(f"[overfit] step {i:3d} loss={loss.item():.4f}")
-            if loss.item() < target:
-                log.info(f"[overfit] reached {loss.item():.4f} < {target} at step {i} ✅")
+            # success = absolute target OR a 75% relative drop. The absolute target is unreachable
+            # when the batch holds same-instance duplicates: with k positives/row the ITC
+            # soft-target loss has an irreducible floor of log(k), so we also accept the relative drop.
+            if loss.item() < target or loss.item() < 0.25 * initial:
+                log.info(f"[overfit] OK: {initial:.3f} -> {loss.item():.4f} "
+                         f"(target<{target} or 75% drop) at step {i}")
                 return loss.item()
-        log.warning(f"[overfit] did NOT reach target ({loss.item():.4f}); check wiring.")
+        log.warning(f"[overfit] did NOT converge ({initial:.3f} -> {loss.item():.4f}); check wiring.")
         return loss.item()
 
     # ------------------------------------------------------------------ main loop
@@ -123,17 +135,22 @@ class Trainer:
     def _evaluate_and_maybe_stop(self) -> bool:
         from .evaluator import evaluate_retrieval
 
+        from ..config import to_dict
+
         rep = evaluate_retrieval(self.model, self.val_dataset, self.device,
                                  num_workers=self.cfg.data.num_workers)
         log.info(f"[VAL-B] {rep}")
         metric = rep["mAP"]
+        # embed the run config so evaluate.py can rebuild the exact architecture (incl. overrides)
+        cfg_dict = to_dict(self.cfg)
         save_checkpoint(str(self.out_dir / "last.pth"), self.model, self.optimizer,
-                        self.scheduler, self.step, self.best_metric)
+                        self.scheduler, self.step, self.best_metric, {"cfg": cfg_dict})
         if metric > self.best_metric:
             self.best_metric = metric
             self.bad_evals = 0
             save_checkpoint(str(self.out_dir / "best.pth"), self.model, self.optimizer,
-                            self.scheduler, self.step, self.best_metric, {"report": rep})
+                            self.scheduler, self.step, self.best_metric,
+                            {"report": rep, "cfg": cfg_dict})
             log.info(f"[VAL-B] new best mAP={metric:.4f} -> saved best.pth")
         else:
             self.bad_evals += 1

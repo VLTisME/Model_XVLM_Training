@@ -16,31 +16,13 @@ from torch.utils.data import DataLoader
 # allow `python scripts/train.py` without installing the package
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from star.config import load_config              # noqa: E402
+from star.config import load_config, parse_overrides  # noqa: E402
 from star.data import GroupedBatchSampler, PABDataset, collate_fn  # noqa: E402
 from star.engine import Trainer                  # noqa: E402
 from star.models import STARModel                # noqa: E402
 from star.utils import get_logger, seed_everything  # noqa: E402
 
 log = get_logger("star.train")
-
-
-def parse_overrides(pairs: list[str]) -> dict:
-    """Parse `--set a.b=1 c=foo` style overrides into a nested dict."""
-    out: dict = {}
-    for pair in pairs:
-        key, _, val = pair.partition("=")
-        node = out
-        parts = key.split(".")
-        for p in parts[:-1]:
-            node = node.setdefault(p, {})
-        try:
-            import ast
-            val = ast.literal_eval(val)
-        except (ValueError, SyntaxError):
-            pass
-        node[parts[-1]] = val
-    return out
 
 
 def main():

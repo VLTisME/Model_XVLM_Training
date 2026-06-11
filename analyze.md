@@ -202,6 +202,13 @@ unit-testable without a GPU or X-VLM.
   distractor steal rank — review fix #3).
 - End-to-end: model builds from the real config (dummy backbone), text frozen (trainable ≈ 50%),
   optimizer uses β=(0.9,0.999) over only trainable params, full training path optimizes.
+- **Full-system smoke (synthetic manifest):** `train.py --overfit-one-batch` converges
+  (2.96 → 0.69, 75%+ drop; the residual is the irreducible log-k ITC floor from same-instance
+  duplicates), full `train.py` runs 3 epochs with VAL-B eval improving + `best.pth`/`last.pth`
+  saved, and `evaluate.py` rebuilds the exact architecture from the **config embedded in the
+  checkpoint** (`missing=0 unexpected=0`). Audit fixes: overfit loop previously ran at **LR=0**
+  (warmup LambdaLR initializes to 0 and the loop never stepped the scheduler) — now pinned to a
+  constant healthy LR with a relative-drop success criterion.
 
 **Top execution risks** (engineering, not modeling):
 1. **VAL-B representativeness** — you tune blind if VAL-B ≠ test distribution. Build several, trust stable winners.
