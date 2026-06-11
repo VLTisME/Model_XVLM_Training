@@ -14,9 +14,9 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 
-_NO_DECAY_KEYS = ("bias", "norm", "layernorm", "temp", "gate", "img_pos", "txt_pos")
+_NO_DECAY_KEYS = ("bias", "norm", "layernorm", "temp", "gate", "img_pos", "txt_pos", "log_var")
 # trainable task heads (text side is frozen, so no txt_proj; MLM removed)
-_HEAD_KEYS = ("itm_head", "img_proj", "vision_proj", "pose")
+_HEAD_KEYS = ("itm_head", "img_proj", "vision_proj", "pose", "weighter")
 
 
 def _is_no_decay(name: str) -> bool:

@@ -16,6 +16,7 @@ import torch
 from torch import Tensor, nn
 
 from ..losses import ITCLoss, ITMLoss, SmoothAPLoss, build_itm_pairs
+from ..losses.weighting import build_weighter
 from .backbone import build_backbone
 from .lora import count_trainable, mark_only_lora_trainable
 from .pose import PoseBranch
@@ -40,11 +41,15 @@ class STARModel(nn.Module):
         self.smap = SmoothAPLoss(tau=cfg.loss.smooth_ap_temp)
         self.itm = ITMLoss()
 
+        # multi-task weighting: fixed (default) | uncertainty | dwa  (analyze.md §14)
+        self.weighter = build_weighter(cfg.loss)
+
         # if real LoRA was injected, train only LoRA + task heads (image proj, ITM head, pose, temp).
         # NOTE: txt_proj is intentionally absent -> text side stays frozen.
         if self.n_lora > 0:
             mark_only_lora_trainable(
-                self, train_heads=("itm_head", "img_proj", "vision_proj", "pose", "temp", "gate"),
+                self, train_heads=("itm_head", "img_proj", "vision_proj", "pose", "temp", "gate",
+                                   "weighter"),
             )
 
     # ------------------------------------------------------------------ info
@@ -87,14 +92,15 @@ class STARModel(nn.Module):
         )
         loss_itm = self.itm(itm_logits, pairs["label"])
 
-        # ---- total: L = w_itc*ITC + lambda_itm*ITM + lambda_smooth_ap*SmoothAP ----
-        c = self.cfg.loss
-        total = c.w_itc * loss_itc + c.lambda_itm * loss_itm + c.lambda_smooth_ap * loss_smap
+        # ---- total: weighter combines the tasks (fixed: w_itc*ITC + λ1*ITM + λ2*SmoothAP) ----
+        total = self.weighter({"itc": loss_itc, "itm": loss_itm, "smap": loss_smap})
+        # components are returned NON-detached so the trainer's per-loss grad-norm diagnostic
+        # (train.grad_norm_every) can backprop through them; harmless for logging (.item()).
         return {
             "loss": total,
-            "loss_itc": loss_itc.detach(),
-            "loss_itm": loss_itm.detach(),
-            "loss_smap": loss_smap.detach(),
+            "loss_itc": loss_itc,
+            "loss_itm": loss_itm,
+            "loss_smap": loss_smap,
         }
 
     @torch.no_grad()

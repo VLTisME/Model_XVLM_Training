@@ -49,8 +49,12 @@ class ModelConfig:
 class LossConfig:
     # PLAN total loss:  L = ITC + lambda_itm * ITM + lambda_smooth_ap * Smooth-AP   (MLM removed)
     w_itc: float = 1.0                # ITC coefficient (fixed at 1.0 in the plan)
-    lambda_itm: float = 1.0           # λ1
-    lambda_smooth_ap: float = 0.3     # λ2
+    lambda_itm: float = 1.0           # λ1 — ITC:ITM = 1:1 is the proven X-VLM/ALBEF ratio: keep
+    lambda_smooth_ap: float = 0.3     # λ2 — the ONE real unknown: sweep {0, 0.1, 0.3, 1.0} on VAL-B
+    # weighting scheme: "fixed" (default, recommended) | "uncertainty" (Kendall 1705.07115)
+    # | "dwa" (Liu 1803.10704). Dynamic modes apply ON TOP of the base weights above (ablation).
+    weighting: str = "fixed"
+    dwa_temp: float = 2.0
     itc_temp_init: float = 0.07
     smooth_ap_temp: float = 0.01
 
@@ -75,6 +79,7 @@ class TrainConfig:
     grad_checkpointing: bool = True
     eval_every_epochs: float = 0.5
     early_stop_patience: int = 2
+    grad_norm_every: int = 0          # >0: every N optimizer steps, log per-loss grad norms
     seed: int = 42
     out_dir: str = "outputs/star_v3"
     log_wandb: bool = False

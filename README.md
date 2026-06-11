@@ -49,6 +49,10 @@ trained with **`L = ITC + λ₁·ITM + λ₂·Smooth-AP`** (MLM removed), with *
 | MLM | **removed** | — |
 
 **Loss:** `L = w_itc·ITC + λ₁·ITM(hard-neg) + λ₂·Smooth-AP`  (defaults `w_itc=1, λ₁=1, λ₂=0.3`).
+ITC:ITM = 1:1 is the proven X-VLM ratio; **sweep λ₂ ∈ {0, 0.1, 0.3, 1.0} on VAL-B**. Dynamic
+weighting is available as an ablation (`loss.weighting: uncertainty | dwa`, Kendall/DWA — applied
+on top of the base weights), plus a per-loss grad-norm diagnostic (`train.grad_norm_every`).
+See `analyze.md` §14.
 
 ---
 

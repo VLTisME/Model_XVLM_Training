@@ -28,8 +28,10 @@ model:
 
 loss:                         # PLAN:  L = w_itc*ITC + lambda_itm*ITM + lambda_smooth_ap*SmoothAP
   w_itc: 1.0
-  lambda_itm: 1.0             # λ1
-  lambda_smooth_ap: 0.3       # λ2 — INFERRED, sweep {0.1, 0.3, 1.0}
+  lambda_itm: 1.0             # λ1 — ITC:ITM = 1:1 is PROVEN (X-VLM/ALBEF): do not tune
+  lambda_smooth_ap: 0.3       # λ2 — the one real unknown: sweep {0, 0.1, 0.3, 1.0} on VAL-B
+  weighting: fixed            # fixed (recommended) | uncertainty (Kendall) | dwa (Liu) — ablation
+  dwa_temp: 2.0
   itc_temp_init: 0.07
   smooth_ap_temp: 0.01
 
@@ -53,6 +55,7 @@ train:
   grad_checkpointing: true
   eval_every_epochs: 0.5
   early_stop_patience: 2
+  grad_norm_every: 0          # >0: log per-loss grad norms every N steps (e.g. 200) — balance diagnostic
   seed: 42
   out_dir: outputs/star_v3
   log_wandb: false

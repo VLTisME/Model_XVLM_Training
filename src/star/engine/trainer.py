@@ -107,6 +107,13 @@ class Trainer:
                     log.error(f"NaN/Inf loss; skipping step. components={out}")
                     self.optimizer.zero_grad(set_to_none=True)
                     continue
+
+                # per-loss grad-norm diagnostic (train.grad_norm_every > 0): shows whether one
+                # task dominates the gradient (the honest way to judge loss-weight balance)
+                gne = self.cfg.train.grad_norm_every
+                if gne and self.step % gne == 0 and (it % accum == 0):
+                    self._log_grad_norms(out)
+
                 self.scaler.scale(loss).backward()
 
                 if (it + 1) % accum == 0:
@@ -120,17 +127,34 @@ class Trainer:
 
                     if self.step % 50 == 0:
                         lr = self.scheduler.get_last_lr()[0]
-                        log.info(
-                            f"e{epoch} s{self.step} loss={out['loss'].item():.3f} "
-                            f"itc={out['loss_itc']:.3f} itm={out['loss_itm']:.3f} "
-                            f"smap={out['loss_smap']:.3f} lr={lr:.2e}"
-                        )
+                        msg = (f"e{epoch} s{self.step} loss={out['loss'].item():.3f} "
+                               f"itc={out['loss_itc']:.3f} itm={out['loss_itm']:.3f} "
+                               f"smap={out['loss_smap']:.3f} lr={lr:.2e}")
+                        weights_fn = getattr(self.model.weighter, "weights", None)
+                        if callable(weights_fn):          # dynamic weighting: show live weights
+                            msg += f" w={weights_fn()}"
+                        log.info(msg)
 
                 if (it + 1) % eval_every == 0 and self.val_dataset is not None:
                     if self._evaluate_and_maybe_stop():
                         log.info("Early stopping.")
                         return
         log.info(f"Training done in {(time.time()-t0)/60:.1f} min. best mAP={self.best_metric:.4f}")
+
+    def _grad_norm_params(self):
+        return [p for p in self.model.parameters() if p.requires_grad]
+
+    def _log_grad_norms(self, out: dict) -> None:
+        """Per-loss gradient norms over trainable params (3 extra backwards; gated by config)."""
+        params = self._grad_norm_params()
+        norms = {}
+        for key in ("loss_itc", "loss_itm", "loss_smap"):
+            grads = torch.autograd.grad(out[key], params, retain_graph=True, allow_unused=True)
+            sq = sum((g.float() ** 2).sum() for g in grads if g is not None)
+            norms[key] = float(torch.sqrt(sq)) if isinstance(sq, torch.Tensor) else 0.0
+        total = sum(norms.values()) or 1.0
+        log.info("[grad-norm] " + " ".join(
+            f"{k.removeprefix('loss_')}={v:.3e}({100 * v / total:.0f}%)" for k, v in norms.items()))
 
     def _evaluate_and_maybe_stop(self) -> bool:
         from .evaluator import evaluate_retrieval

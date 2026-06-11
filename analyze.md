@@ -183,6 +183,35 @@ $$\boxed{\;L = w_\text{itc}\,\text{ITC} + \lambda_1\,\text{ITM(hard-neg)} + \lam
 `forward` returns `{loss, loss_itc, loss_itm, loss_smap}`. Trainable share with text frozen ≈ 50%
 on the dummy; with real LoRA only adapters + ITM head + image proj + pose + temp train.
 
+### Choosing the λ's — and the dynamic-weighting options (`loss.weighting`)
+The only real unknown is **λ₂** (Smooth-AP): ITC:ITM = 1:1 is the proven X-VLM/ALBEF ratio — keep
+it. Default procedure: **sweep λ₂ ∈ {0, 0.1, 0.3, 1.0} on VAL-B** (0 included, since Smooth-AP is
+unproven on text-person; if 0 wins, drop it). Wins smaller than seed std are not real.
+
+For ablation, two dynamic schemes are built in (`src/star/losses/weighting.py`), both applied ON
+TOP of the fixed base weights so the 1:1 prior is preserved:
+- **`uncertainty`** (Kendall [1705.07115]): $L=\sum_i e^{-s_i}\,w_iL_i+s_i$ with learnable
+  $s_i=\log\sigma_i^2$ (init 0 ⇒ exactly the fixed loss at start; no weight decay on $s$).
+  Equilibrium drives each weighted loss toward ~1 — known caveat: can down-weight the hardest task.
+- **`dwa`** (Liu [1803.10704]): $k_i = K\cdot\text{softmax}(r_i/T)$, $r_i = L_i(t{-}1)/L_i(t{-}2)$
+  — up-weights slowly-descending losses; stateless params, equal weights for the first two steps.
+- Not implemented on purpose: GradNorm [1711.02257] / PCGrad [2001.06782] — extra per-task
+  backwards are not justified for 3 losses on LoRA params.
+
+**Balance diagnostic:** `train.grad_norm_every: N` logs per-loss gradient norms (and each task's
+share %) every N steps — the honest way to see whether one term dominates before reweighting.
+Note that the loss *values* have different natural scales (ITC ~ log batch, ITM ~ log 2,
+Smooth-AP ∈ [0,1]); gradient share, not loss magnitude, is what matters.
+
+**Epochs:** early stopping on VAL-B mAP *is* the epoch selector (eval every 0.5 epoch, patience
+2–3, `best.pth`); cap at 8–10, expect the peak at ~3–6 — train-loss keeps falling on synthetic
+while real-domain mAP plateaus (sim2real), so do not train to the cap.
+
+**Batch-size subtlety (XBM removed):** ITC negatives come only from the *real per-step batch*
+(+ all_gather under DDP). `grad_accum` does NOT add contrastive negatives — each micro-batch
+softmaxes over itself; it only smooths ITM/Smooth-AP gradients. To get more negatives: bigger
+actual batch (grad-ckpt + AMP) or multi-GPU.
+
 ---
 
 ## §15 Code architecture, validation & risks
