@@ -173,7 +173,17 @@ keeps using the dummy backbone (the X-VLM import is lazy).
 
 ---
 
-## 6. Status & honesty
+## 6. Run on Kaggle (10K trial)
+
+Use **[`notebooks/kaggle_train_10k.ipynb`](notebooks/kaggle_train_10k.ipynb)** (Accelerator = **T4 GPU**,
+Internet = **ON**). It clones this repo, builds the pinned X-VLM env *without touching Kaggle's CUDA
+torch*, downloads the 16M checkpoint, and trains with [`configs/star_v3_10k_kaggle.yaml`](configs/star_v3_10k_kaggle.yaml)
+(batch 16 @384, fp16, 6 epochs + early-stop). The **DATA cell** is a placeholder: flip
+`USE_REAL_DATA=True` and point at the data team's Kaggle Dataset (schema in §4); until then a
+synthetic 10K manifest keeps the notebook runnable end-to-end (timing/pipeline test only).
+Estimated T4 time: **~45–100 min** (logs show the real s/step within the first minute).
+
+## 7. Status & honesty
 - ✅ losses / metrics / hard-neg / LoRA / optimizer / trainer / distractor-aware evaluator —
   complete, **28 unit tests pass**.
 - ✅ **real X-VLM backbone wired + validated** (16M checkpoint, 48 LoRA layers, text frozen) — §5.

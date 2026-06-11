@@ -37,7 +37,10 @@ class Trainer:
         self.amp_dtype = _AMP_DTYPE[cfg.train.amp_dtype]
         self.use_scaler = cfg.train.amp_dtype == "fp16"
         self.device_type = "cuda" if "cuda" in str(device) else "cpu"
-        self.scaler = torch.amp.GradScaler(self.device_type, enabled=self.use_scaler)
+        if hasattr(torch.amp, "GradScaler"):                  # torch >= 2.4
+            self.scaler = torch.amp.GradScaler(self.device_type, enabled=self.use_scaler)
+        else:                                                 # torch 2.1 (pinned X-VLM venv)
+            self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_scaler)
 
         self.out_dir = Path(cfg.train.out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)

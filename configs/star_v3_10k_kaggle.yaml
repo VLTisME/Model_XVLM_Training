@@ -1,0 +1,59 @@
+# STAR-v3 — 10K trial run profile for Kaggle (1x T4 16GB, fp16).
+# Used by notebooks/kaggle_train_10k.ipynb. Data paths are placeholders — the notebook
+# overrides data.manifest / data.image_root (real data from the data team, or the built-in
+# synthetic fallback). See README "Run on Kaggle".
+
+data:
+  manifest: data/smoke10k/manifest.parquet   # <-- overridden by the notebook DATA cell
+  image_root: data/smoke10k
+  image_size: 384
+  max_token: 100
+  lhp_enabled: false          # toggle later, only after VAL-B says it helps
+  lhp_min_scale: 0.5
+  lhp_use_bbox: true
+  group_by: scene
+  group_fraction: 0.5
+  num_workers: 2              # Kaggle gives ~4 vCPU
+
+model:
+  backbone: xvlm
+  checkpoint: data/checkpoints/xvlm_16m_base.th   # downloaded by the notebook (825 MB)
+  embed_dim: 256
+  lora_enabled: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_targets: [query, value]
+  lora_freeze_text: true
+  pose_enabled: false
+
+loss:
+  w_itc: 1.0
+  lambda_itm: 1.0
+  lambda_smooth_ap: 0.3       # sweep {0, 0.1, 0.3, 1.0} once real data is in
+  weighting: fixed
+  dwa_temp: 2.0
+  itc_temp_init: 0.07
+  smooth_ap_temp: 0.01
+
+optim:
+  lr_lora: 2.0e-4
+  lr_head: 4.0e-4
+  weight_decay: 0.02
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  grad_clip: 1.0
+  warmup_epochs: 1.0
+  epochs: 6                   # early stopping usually ends at 3-5 on 10K
+
+train:
+  batch_size: 16              # T4 16GB @384px; try 24 if VRAM headroom (watch the log)
+  grad_accum: 2               # smooths ITM/SmoothAP; does NOT add ITC negatives
+  amp_dtype: fp16             # T4 has no bf16
+  grad_checkpointing: true    # NOTE: flag reserved; not yet wired into X-VLM modules
+  eval_every_epochs: 0.5
+  early_stop_patience: 2
+  grad_norm_every: 200        # log per-loss grad shares every 200 steps
+  seed: 42
+  out_dir: outputs/run10k
+  log_wandb: false
