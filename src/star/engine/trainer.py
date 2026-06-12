@@ -82,7 +82,9 @@ class Trainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
             if i % 25 == 0:
-                log.info(f"[overfit] step {i:3d} loss={loss.item():.4f}")
+                vram = (f" vram={torch.cuda.max_memory_allocated()/2**30:.1f}G"
+                        if torch.cuda.is_available() else "")
+                log.info(f"[overfit] step {i:3d} loss={loss.item():.4f}{vram}")
             # success = absolute target OR a 70% relative drop. The absolute target is unreachable
             # when the batch holds same-instance duplicates: with k positives/row the ITC
             # soft-target loss has an irreducible floor of log(k) (e.g. log 2 = 0.693 with the
@@ -137,6 +139,8 @@ class Trainer:
                         msg = (f"e{epoch} s{self.step} loss={out['loss'].item():.3f} "
                                f"itc={out['loss_itc']:.3f} itm={out['loss_itm']:.3f} "
                                f"smap={out['loss_smap']:.3f} lr={lr:.2e}")
+                        if torch.cuda.is_available():
+                            msg += f" vram={torch.cuda.max_memory_allocated()/2**30:.1f}G"
                         weights_fn = getattr(self.model.weighter, "weights", None)
                         if callable(weights_fn):          # dynamic weighting: show live weights
                             msg += f" w={weights_fn()}"
