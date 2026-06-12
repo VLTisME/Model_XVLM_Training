@@ -59,9 +59,11 @@ def evaluate_retrieval(model, dataset, device, batch_size: int = 64, num_workers
                         collate_fn=_eval_collate)
     img_feats, txt_feats, image_ids, is_query = [], [], [], []
     for batch in loader:
+        kpts = batch.get("keypoints")
         fv, ft = model.encode_for_eval(batch["image"].to(device),
                                        batch["input_ids"].to(device),
-                                       batch["attention_mask"].to(device))
+                                       batch["attention_mask"].to(device),
+                                       keypoints=kpts.to(device) if kpts is not None else None)
         img_feats.append(fv.float().cpu())
         txt_feats.append(ft.float().cpu())
         image_ids.extend(batch["image_id"])
@@ -72,10 +74,14 @@ def evaluate_retrieval(model, dataset, device, batch_size: int = 64, num_workers
 
 
 def _eval_collate(batch):
-    return {
+    out = {
         "image": torch.stack([b["image"] for b in batch]),
         "input_ids": torch.stack([b["input_ids"] for b in batch]),
         "attention_mask": torch.stack([b["attention_mask"] for b in batch]),
         "image_id": [b["image_id"] for b in batch],
         "is_query": [b["is_query"] for b in batch],
     }
+    # pose branch needs keypoints at eval too (train/eval consistency)
+    if all("keypoints" in b for b in batch):
+        out["keypoints"] = torch.stack([b["keypoints"] for b in batch])
+    return out

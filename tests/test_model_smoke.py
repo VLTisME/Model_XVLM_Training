@@ -50,6 +50,22 @@ def test_text_tower_is_frozen():
     assert any(p.requires_grad for n, p in model.named_parameters() if "patch" in n or "img_proj" in n)
 
 
+def test_pose_fused_at_eval_when_enabled():
+    # train/eval consistency: with the pose branch on, encode_for_eval MUST fuse keypoints
+    cfg = _tiny_cfg()
+    cfg.model.pose_enabled = True
+    model = STARModel(cfg)
+    model.eval()
+    img = torch.randn(2, 3, 384, 384)
+    ids = torch.randint(5, 900, (2, 16))
+    mask = torch.ones(2, 16, dtype=torch.long)
+    kpts = torch.rand(2, 51)
+    with torch.no_grad():
+        f_plain, _ = model.encode_for_eval(img, ids, mask)
+        f_pose, _ = model.encode_for_eval(img, ids, mask, keypoints=kpts)
+    assert not torch.allclose(f_plain, f_pose), "pose branch must change eval image features"
+
+
 def test_overfit_one_batch_decreases_loss():
     torch.manual_seed(0)
     model = STARModel(_tiny_cfg())

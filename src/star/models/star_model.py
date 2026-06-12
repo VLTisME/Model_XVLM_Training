@@ -104,8 +104,14 @@ class STARModel(nn.Module):
         }
 
     @torch.no_grad()
-    def encode_for_eval(self, image, ids, mask):
-        """Return (img_feat, txt_feat) for retrieval evaluation (no augmentation)."""
+    def encode_for_eval(self, image, ids, mask, keypoints=None):
+        """Return (img_feat, txt_feat) for retrieval evaluation (no augmentation).
+
+        If the pose branch is enabled, keypoints MUST be fused here too — otherwise the
+        eval embedding space differs from the trained one (train/eval mismatch).
+        """
         _, img_feat = self.backbone.encode_image(image)
+        if self.pose is not None and keypoints is not None:
+            img_feat = self.pose(img_feat, keypoints)
         _, txt_feat = self.backbone.encode_text(ids, mask)
         return img_feat, txt_feat
