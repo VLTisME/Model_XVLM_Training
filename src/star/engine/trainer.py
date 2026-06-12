@@ -83,14 +83,18 @@ class Trainer:
             self.scaler.update()
             if i % 25 == 0:
                 log.info(f"[overfit] step {i:3d} loss={loss.item():.4f}")
-            # success = absolute target OR a 75% relative drop. The absolute target is unreachable
+            # success = absolute target OR a 70% relative drop. The absolute target is unreachable
             # when the batch holds same-instance duplicates: with k positives/row the ITC
-            # soft-target loss has an irreducible floor of log(k), so we also accept the relative drop.
-            if loss.item() < target or loss.item() < 0.25 * initial:
+            # soft-target loss has an irreducible floor of log(k) (e.g. log 2 = 0.693 with the
+            # video-grouped sampler — observed exactly on the 10k_hard Kaggle run), so the
+            # relative criterion must leave headroom above that floor.
+            if loss.item() < target or loss.item() < 0.30 * initial:
                 log.info(f"[overfit] OK: {initial:.3f} -> {loss.item():.4f} "
-                         f"(target<{target} or 75% drop) at step {i}")
+                         f"(target<{target} or 70% drop) at step {i}")
                 return loss.item()
-        log.warning(f"[overfit] did NOT converge ({initial:.3f} -> {loss.item():.4f}); check wiring.")
+        log.warning(f"[overfit] did NOT converge ({initial:.3f} -> {loss.item():.4f}). NOTE: if the "
+                    f"loss PLATEAUED near log(k) of same-id duplicates (e.g. ~0.69), wiring is fine; "
+                    f"a flat or rising curve is the real red flag.")
         return loss.item()
 
     # ------------------------------------------------------------------ main loop
