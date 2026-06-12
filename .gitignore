@@ -1,10 +1,10 @@
-# data & artifacts
-data/
-manifests/
-checkpoints/
-outputs/
-runs/
-wandb/
+# data & artifacts (ROOT-anchored — bare "data/" would also ignore src/star/data!)
+/data/
+/manifests/
+/checkpoints/
+/outputs/
+/runs/
+/wandb/
 *.webp
 *.jpg
 *.png
