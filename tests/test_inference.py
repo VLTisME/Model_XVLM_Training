@@ -1,8 +1,8 @@
-"""Inference pipeline math: stage-1 ranks, rerank rank bookkeeping, Gale-Shapley."""
+"""Inference pipeline math: stage-1 ranks, rerank rank bookkeeping, Gale-Shapley, pairwise/RRF."""
 import torch
 
-from star.inference import (apply_gale_shapley, gale_shapley_match,
-                            ranks_after_rerank, report_from_ranks, stage1_ranks)
+from star.inference import (apply_gale_shapley, gale_shapley_match, pairwise_rerank,
+                            ranks_after_rerank, report_from_ranks, rrf_fuse, stage1_ranks)
 
 
 def test_stage1_ranks_basic_and_ties():
@@ -114,6 +114,49 @@ def _make_dummy_eval(tmp_path, captions, seed=0):
     m = tmp_path / "m.parquet"
     pd.DataFrame(rows).to_parquet(m, index=False)
     return str(m)
+
+
+def test_pairwise_rerank_promotes_strongest():
+    """Round-robin with a stub comparator head(a,b)=a[:,0]-b[:,0]: the candidate with the largest
+    feature-0 beats the most others -> lands at rank 1."""
+    feats = torch.tensor([[0.1], [0.9], [0.5], [0.2]])          # [N=4, H=1]
+    order = pairwise_rerank(lambda a, b: (a[:, 0] - b[:, 0]), feats)
+    assert order[0].item() == 1                                 # idx 1 (0.9) wins the tournament
+    assert order.tolist() == [1, 2, 3, 0]
+
+
+def test_rrf_fuse_combines_rankings():
+    # item 2 is high in both lists -> should top the fusion; reciprocal-rank weighted
+    fused = rrf_fuse([[2, 0, 1, 3], [2, 1, 0, 3]])
+    assert fused[0] == 2 and set(fused) == {0, 1, 2, 3}
+
+
+def test_run_pipeline_with_pairwise_head(tmp_path):
+    """End-to-end: passing a PairwiseHead adds a 'pairwise' stage with valid metrics (dummy model)."""
+    from star.config import Config
+    from star.data import PABDataset
+    from star.inference import run_pipeline
+    from star.models import PairwiseHead, STARModel
+
+    m = _make_dummy_eval(tmp_path, [f"person {i}" for i in range(10)], seed=7)
+    cfg = Config()
+    cfg.model.backbone = "dummy"
+    cfg.model.embed_dim = 32
+    model = STARModel(cfg)
+    ds = PABDataset(m, str(tmp_path), model.backbone.tokenizer, split="valb", train=False)
+    # cross-feature dim of this backbone -> build a matching head
+    b = ds[0]
+    te, _ = model.backbone.encode_text(b["input_ids"].unsqueeze(0), b["attention_mask"].unsqueeze(0))
+    ie, _ = model.backbone.encode_image(b["image"].unsqueeze(0))
+    dim = model.backbone.cross_feature(ie, te, b["attention_mask"].unsqueeze(0)).size(-1)
+    head = PairwiseHead(dim)
+
+    res = run_pipeline(model, ds, "cpu", topk=5, batch_size=4, num_workers=0,
+                       pairwise_head=head, pairwise_topn=5)
+    assert "pairwise" in res and "rerank" in res
+    for k in ("mAP", "R@1", "R@5", "R@10"):
+        assert 0.0 <= res["pairwise"][k] <= 1.0
+    assert res["num_queries"] == 10 and res["gallery_size"] == 10
 
 
 def test_pipeline_full_self_gallery_no_distractors(tmp_path):

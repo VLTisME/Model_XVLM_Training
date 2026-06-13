@@ -108,6 +108,9 @@ class _DummyXVLM(nn.Module):
         fused = self._cross(img_embeds, txt_embeds, txt_mask)
         return self.itm_head(fused[:, 0])           # [P, 2] from [CLS]
 
+    def cross_feature(self, img_embeds, txt_embeds, txt_mask):
+        return self._cross(img_embeds, txt_embeds, txt_mask)[:, 0]   # [P, H] fused [CLS]
+
 
 class DummyBackbone(nn.Module):
     """Adapter exposing the stable interface around _DummyXVLM."""
@@ -125,6 +128,9 @@ class DummyBackbone(nn.Module):
 
     def itm_logits(self, img_embeds, txt_embeds, txt_mask):
         return self.net.itm_logits(img_embeds, txt_embeds, txt_mask)
+
+    def cross_feature(self, img_embeds, txt_embeds, txt_mask):
+        return self.net.cross_feature(img_embeds, txt_embeds, txt_mask)
 
     def setup_finetuning(self, cfg) -> int:
         """Inject LoRA (image + cross only) and freeze the text tower per the plan.
@@ -212,6 +218,11 @@ class XVLMBackbone(nn.Module):
         img_atts = torch.ones(img_embeds.size()[:-1], dtype=torch.long, device=img_embeds.device)
         cross = self.model.get_cross_embeds(img_embeds, img_atts, text_embeds=txt_embeds, text_atts=txt_mask)
         return self.model.itm_head(cross[:, 0, :])
+
+    def cross_feature(self, img_embeds, txt_embeds, txt_mask):
+        img_atts = torch.ones(img_embeds.size()[:-1], dtype=torch.long, device=img_embeds.device)
+        cross = self.model.get_cross_embeds(img_embeds, img_atts, text_embeds=txt_embeds, text_atts=txt_mask)
+        return cross[:, 0, :]                          # [P, H] fused [CLS] (the vector ITM head reads)
 
     def setup_finetuning(self, cfg) -> int:
         from .lora import inject_lora

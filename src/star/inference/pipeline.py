@@ -211,6 +211,53 @@ def apply_gale_shapley(order: Tensor, matched: Tensor, ranks_in: Tensor,
     return ranks, new_order
 
 
+# --------------------------------------------------------------------------- (pairwise / duo)
+@torch.no_grad()
+def pairwise_features(model, gallery_embeds: Tensor, txt_embeds: Tensor, txt_masks: Tensor,
+                      idx: Tensor, device) -> Tensor:
+    """Cross-encoder fused [CLS] feature for each (query, candidate) in `idx` [Q, N] -> [Q, N, H] cpu.
+
+    N is small (top-N to compare, e.g. 10) so this is ~N cross-encoder forwards per query — cheap.
+    """
+    model.eval()
+    use_amp = "cuda" in str(device)
+    Q, N = idx.shape
+    out = None
+    for qi in range(Q):
+        t_emb = txt_embeds[qi].unsqueeze(0).expand(N, -1, -1).to(device)
+        t_mask = txt_masks[qi].unsqueeze(0).expand(N, -1).to(device)
+        img = gallery_embeds[idx[qi]].to(device).float()                 # [N, Ni, H]
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+            h = model.backbone.cross_feature(img, t_emb, t_mask)         # [N, H]
+        if out is None:
+            out = torch.empty(Q, N, h.size(-1))
+        out[qi] = h.float().cpu()
+    return out
+
+
+@torch.no_grad()
+def pairwise_rerank(head, feats: Tensor) -> Tensor:
+    """Round-robin: head(a,b)=logit P(a>b) over N candidates -> Borda order (local perm [N]).
+
+    `head` is any callable mapping ([M,H],[M,H]) -> [M] logits (a PairwiseHead or a test stub).
+    """
+    N = feats.size(0)
+    a = feats.unsqueeze(1).expand(N, N, -1).reshape(N * N, -1)
+    b = feats.unsqueeze(0).expand(N, N, -1).reshape(N * N, -1)
+    P = torch.sigmoid(head(a, b)).reshape(N, N)
+    P.fill_diagonal_(0.0)
+    return P.sum(dim=1).argsort(descending=True)                         # who beats the most others
+
+
+def rrf_fuse(orders: list[list[int]], k: int = 60) -> list[int]:
+    """Reciprocal Rank Fusion of several ranked lists over the SAME item set (Cormack 2009)."""
+    score: dict[int, float] = {}
+    for order in orders:
+        for rank, idx in enumerate(order):
+            score[int(idx)] = score.get(int(idx), 0.0) + 1.0 / (k + rank)
+    return sorted(score, key=lambda i: score[i], reverse=True)
+
+
 # --------------------------------------------------------------------------- reporting
 def report_from_ranks(ranks: Tensor, ks=(1, 5, 10)) -> dict[str, float]:
     r = ranks.float()
@@ -224,8 +271,12 @@ def report_from_ranks(ranks: Tensor, ks=(1, 5, 10)) -> dict[str, float]:
 @torch.no_grad()
 def run_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
                  num_workers: int = 2, use_gale_shapley: bool = True,
-                 pair_chunk: int = 50) -> dict:
-    """Full inference. Returns stage-wise reports + final top-10 per query."""
+                 pair_chunk: int = 50, pairwise_head=None, pairwise_topn: int = 10) -> dict:
+    """Full inference. Returns stage-wise reports + final top-10 per query.
+
+    If `pairwise_head` (a trained PairwiseHead) is given, a 'pairwise' stage reorders the top-N of
+    the ITM order by a round-robin tournament and RRF-fuses it back — measured independently.
+    """
     enc = encode_eval_set(model, dataset, device, batch_size, num_workers)
     sim = enc["txt_feats"] @ enc["gallery_feats"].t()                    # [Q, G]
     K = min(topk, sim.size(1))
@@ -239,14 +290,39 @@ def run_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
     final = itm + topk_sim                                                # BLIP: logit + cosine
     ranks2, order2 = ranks_after_rerank(sim, topk_idx, final, enc["gt_pos"], ranks1)
     rep2 = report_from_ranks(ranks2)
+    reports = {"stage1": rep1, "rerank": rep2}
+    ranks_out = {"stage1": ranks1, "rerank": ranks2}
 
+    # (pairwise / duo) reorder the top-N of the ITM order via the comparator, RRF-fused
+    order_pw, ranks_pw = order2, ranks2
+    if pairwise_head is not None:
+        N = min(pairwise_topn, K)
+        feats = pairwise_features(model, enc["gallery_embeds"], enc["txt_embeds"],
+                                  enc["txt_masks"], order2[:, :N], device)
+        order_pw = order2.clone()
+        ranks_pw = ranks2.clone()
+        for q in range(order2.size(0)):
+            itm_order = order2[q].tolist()
+            perm = pairwise_rerank(pairwise_head, feats[q]).tolist()
+            pw_topn = [itm_order[p] for p in perm]
+            fused_topn = rrf_fuse([pw_topn, itm_order[:N]])              # blend duo + ITM on top-N
+            full = fused_topn + itm_order[N:]
+            order_pw[q] = torch.tensor(full, dtype=order2.dtype)
+            hit = (order_pw[q] == enc["gt_pos"][q]).nonzero(as_tuple=True)[0]
+            ranks_pw[q] = int(hit[0]) + 1 if len(hit) else int(ranks2[q])
+        reports["pairwise"] = report_from_ranks(ranks_pw)
+        ranks_out["pairwise"] = ranks_pw
+
+    base_order, base_ranks = order_pw, ranks_pw          # GS runs on the best order so far
     if use_gale_shapley:
         scores2 = torch.gather(final, 1, final.argsort(dim=1, descending=True))
         matched = gale_shapley_match(order2, scores2)
-        ranks3, order3 = apply_gale_shapley(order2, matched, ranks2, enc["gt_pos"])
+        ranks3, order3 = apply_gale_shapley(base_order, matched, base_ranks, enc["gt_pos"])
         rep3 = report_from_ranks(ranks3)
     else:
-        ranks3, order3, rep3 = ranks2, order2, rep2
+        ranks3, order3, rep3 = base_ranks, base_order, report_from_ranks(base_ranks)
+    reports["gale_shapley"] = rep3
+    ranks_out["final"] = ranks3
 
     # top-10 = reranked K-block first, then the stage-1 tail (items outside the block keep
     # their cosine order) — matters when topk < 10 and is the correct general semantics
@@ -257,6 +333,5 @@ def run_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
         tail = [int(g) for g in s1_order[q] if int(g) not in set(seen)]
         full = (seen + tail)[:10]
         top10.append([enc["gallery_ids"][g] for g in full])
-    return dict(stage1=rep1, rerank=rep2, gale_shapley=rep3,
-                ranks={"stage1": ranks1, "rerank": ranks2, "final": ranks3},
+    return dict(**reports, ranks=ranks_out,
                 top10=top10, gallery_size=sim.size(1), num_queries=sim.size(0), topk=K)
