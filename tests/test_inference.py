@@ -96,3 +96,69 @@ def test_full_pipeline_smoke_with_dummy_model(tmp_path):
     #  legitimately exhaust its candidate list and stay unmatched, so don't assert it)
     for t in res["top10"]:
         assert len(set(t)) == len(t)
+
+
+def _make_dummy_eval(tmp_path, captions, seed=0):
+    """Write a tiny eval manifest + jpgs; `captions[i]` ("" => distractor) drives is_query."""
+    import numpy as np
+    import pandas as pd
+    from PIL import Image
+
+    rng = np.random.default_rng(seed)
+    rows = []
+    for i, cap in enumerate(captions):
+        Image.fromarray((rng.random((64, 64, 3)) * 255).astype("uint8")).save(tmp_path / f"g{i}.jpg")
+        rows.append(dict(image_path=f"g{i}.jpg", caption=cap, split="valb",
+                         sequence_id=f"s{i}", scene=f"s{i}", action="x",
+                         image_id=f"img{i}", bbox=None, keypoints=None))
+    m = tmp_path / "m.parquet"
+    pd.DataFrame(rows).to_parquet(m, index=False)
+    return str(m)
+
+
+def test_pipeline_full_self_gallery_no_distractors(tmp_path):
+    """V5 / paper protocol: gallery = the whole test set, EVERY image is both a query and a
+    gallery candidate (no distractors). num_queries must equal gallery_size, GT = own image."""
+    from star.config import Config
+    from star.data import PABDataset
+    from star.inference import run_pipeline
+    from star.models import STARModel
+
+    n = 12
+    m = _make_dummy_eval(tmp_path, [f"person number {i} doing a thing" for i in range(n)], seed=1)
+    cfg = Config()
+    cfg.model.backbone = "dummy"
+    cfg.model.embed_dim = 32
+    model = STARModel(cfg)
+    ds = PABDataset(m, str(tmp_path), model.backbone.tokenizer, split="valb", train=False)
+    res = run_pipeline(model, ds, "cpu", topk=5, batch_size=4, num_workers=0)
+
+    assert res["num_queries"] == n and res["gallery_size"] == n   # every row is query AND gallery
+    for stage in ("stage1", "rerank", "gale_shapley"):
+        for k in ("mAP", "R@1", "R@5", "R@10"):
+            assert 0.0 <= res[stage][k] <= 1.0
+    # single GT per query => mAP == MRR exactly, at every stage
+    for stage in ("stage1", "rerank", "gale_shapley"):
+        assert abs(res[stage]["mAP"] - res[stage]["MRR"]) < 1e-6
+
+
+def test_pipeline_pose_enabled_checkpoint_without_keypoints(tmp_path):
+    """The v3c-on-old-test path: a checkpoint trained with pose_enabled=True must still evaluate
+    when the manifest has NO keypoints. The pipeline encodes via backbone.encode_image and never
+    calls the pose branch, so it runs (pose-OFF) rather than raising."""
+    from star.config import Config
+    from star.data import PABDataset
+    from star.inference import run_pipeline
+    from star.models import STARModel
+
+    m = _make_dummy_eval(tmp_path, ["a person"] * 4 + [""] * 4, seed=2)
+    cfg = Config()
+    cfg.model.backbone = "dummy"
+    cfg.model.embed_dim = 32
+    cfg.model.pose_enabled = True                       # build the pose branch...
+    model = STARModel(cfg)
+    assert model.pose is not None                       # ...it exists in the model
+    ds = PABDataset(m, str(tmp_path), model.backbone.tokenizer, split="valb", train=False)
+    res = run_pipeline(model, ds, "cpu", topk=4, batch_size=4, num_workers=0)  # must NOT raise
+
+    assert res["num_queries"] == 4 and res["gallery_size"] == 8
