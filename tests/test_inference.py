@@ -162,3 +162,44 @@ def test_pipeline_pose_enabled_checkpoint_without_keypoints(tmp_path):
     res = run_pipeline(model, ds, "cpu", topk=4, batch_size=4, num_workers=0)  # must NOT raise
 
     assert res["num_queries"] == 4 and res["gallery_size"] == 8
+
+
+def test_pipeline_fuses_pose_when_keypoints_present(tmp_path):
+    """With a pose branch AND keypoints in the manifest, the pipeline fuses pose into the image
+    feature (matching a pose-ON checkpoint), so the gallery features differ from the pose-OFF run.
+    This is the 'eval v3c WITH ViTPose keypoints' path."""
+    import numpy as np
+    import pandas as pd
+    import torch
+    from PIL import Image
+    from star.config import Config
+    from star.data import PABDataset
+    from star.inference import encode_eval_set
+    from star.models import STARModel
+
+    rng = np.random.default_rng(3)
+    rows_no, rows_yes = [], []
+    for i in range(6):
+        Image.fromarray((rng.random((64, 64, 3)) * 255).astype("uint8")).save(tmp_path / f"g{i}.jpg")
+        base = dict(image_path=f"g{i}.jpg", caption="a person", split="valb",
+                    sequence_id=f"s{i}", scene=f"s{i}", action="x", image_id=f"img{i}", bbox=None)
+        rows_no.append({**base, "keypoints": None})
+        rows_yes.append({**base, "keypoints": list(rng.random(51).astype(float))})
+    p_no, p_yes = tmp_path / "no.parquet", tmp_path / "yes.parquet"
+    pd.DataFrame(rows_no).to_parquet(p_no, index=False)
+    pd.DataFrame(rows_yes).to_parquet(p_yes, index=False)
+
+    cfg = Config()
+    cfg.model.backbone = "dummy"
+    cfg.model.embed_dim = 32
+    cfg.model.pose_enabled = True
+    model = STARModel(cfg)
+    tok = model.backbone.tokenizer
+    enc_no = encode_eval_set(model, PABDataset(str(p_no), str(tmp_path), tok, split="valb", train=False),
+                             "cpu", batch_size=6, num_workers=0)
+    enc_yes = encode_eval_set(model, PABDataset(str(p_yes), str(tmp_path), tok, split="valb", train=False),
+                              "cpu", batch_size=6, num_workers=0)
+    # pose fusion changed the GLOBAL image features...
+    assert not torch.allclose(enc_no["gallery_feats"], enc_yes["gallery_feats"])
+    # ...but NOT the region embeds the cross-encoder uses (ITM never sees pose)
+    assert torch.allclose(enc_no["gallery_embeds"].float(), enc_yes["gallery_embeds"].float())

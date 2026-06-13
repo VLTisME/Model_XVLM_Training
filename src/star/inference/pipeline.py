@@ -34,6 +34,10 @@ def _collate(batch):
         "image_id": [b["image_id"] for b in batch],
         "is_query": [b["is_query"] for b in batch],
     }
+    # keypoints only batched if EVERY item has them (pose branch needs the full batch) — mirrors
+    # the train collate. Used to fuse pose into the image feature for pose-trained checkpoints.
+    if all("keypoints" in b for b in batch):
+        out["keypoints"] = torch.stack([b["keypoints"] for b in batch])
     return out
 
 
@@ -45,11 +49,17 @@ def encode_eval_set(model, dataset, device, batch_size: int = 64, num_workers: i
     wins); rows with a caption are queries. Returns CPU tensors:
         gallery: feats [G, d] fp32 · embeds [G, Ni, H] fp16 · ids list
         queries: txt_feats [Q, d] · txt_embeds [Q, L, H] · masks [Q, L] · gt_pos [Q]
+
+    Pose: if the model has a pose branch AND the batch carries keypoints, pose is fused into the
+    GLOBAL image feature (`img_feat`), matching how a pose-ON checkpoint was trained. The region
+    embeds (`img_embeds`, used by the cross-encoder) are left untouched — ITM never uses pose.
+    A model with no pose branch (or a manifest with no keypoints) is evaluated pose-OFF.
     """
     model.eval()
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
                         num_workers=num_workers, collate_fn=_collate)
     use_amp = "cuda" in str(device)
+    pose = getattr(model, "pose", None)
 
     id_to_pos: dict = {}
     g_feats, g_embeds, g_ids = [], [], []
@@ -59,6 +69,8 @@ def encode_eval_set(model, dataset, device, batch_size: int = 64, num_workers: i
         image = batch["image"].to(device, non_blocking=True)
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
             img_embeds, img_feat = model.backbone.encode_image(image)
+        if pose is not None and "keypoints" in batch:
+            img_feat = pose(img_feat.float(), batch["keypoints"].to(device).float())
         for r in range(image.size(0)):
             iid = batch["image_id"][r]
             if iid not in id_to_pos:
