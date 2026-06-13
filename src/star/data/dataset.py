@@ -76,6 +76,29 @@ class PABDataset(Dataset):
             return [None] * len(self.df)
         return self.df[key].tolist()
 
+    def pairs(self) -> tuple[list, list]:
+        """(anchor_idx, partner_idx) pairs for PairBatchSampler + per-pair group (video).
+
+        Requires manifest columns `image_id` and `pair_image_id` (anchor rows carry the
+        data-team-mined hard image's id; non-anchor rows have null). Partners outside this
+        split are skipped (cannot happen when the split is by video).
+        """
+        if "pair_image_id" not in self.df.columns or "image_id" not in self.df.columns:
+            return [], []
+        pos = {str(iid): i for i, iid in enumerate(self.df["image_id"])}
+        group_col = ("video_id" if "video_id" in self.df.columns
+                     else "scene" if "scene" in self.df.columns else None)
+        pairs, groups = [], []
+        for i, pid in enumerate(self.df["pair_image_id"]):
+            if pid is None or (isinstance(pid, float)):
+                continue
+            j = pos.get(str(pid))
+            if j is None or j == i:
+                continue
+            pairs.append((i, j))
+            groups.append(self.df[group_col].iat[i] if group_col else i)
+        return pairs, groups
+
     def _load_image(self, rel_path: str) -> Image.Image:
         p = Path(rel_path)
         if not p.is_absolute():

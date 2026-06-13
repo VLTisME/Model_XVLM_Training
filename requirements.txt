@@ -7,8 +7,8 @@ einops>=0.7.0
 
 # Data
 numpy>=1.24
-pandas>=2.0
-pyarrow>=14.0          # parquet manifest
+pandas>=2.0,<3         # pandas 3 defaults to pyarrow-backed strings -> native crash with torch on Windows
+pyarrow>=14.0,<20      # parquet manifest (pyarrow 24 DLL access-violates alongside torch on Windows)
 Pillow>=10.0
 opencv-python>=4.8     # webp decode, bbox ops
 ftfy>=6.1              # caption cleaning

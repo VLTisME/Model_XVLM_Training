@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from star.config import load_config, parse_overrides  # noqa: E402
-from star.data import GroupedBatchSampler, PABDataset, collate_fn  # noqa: E402
+from star.data import GroupedBatchSampler, PABDataset, PairBatchSampler, collate_fn  # noqa: E402
 from star.engine import Trainer                  # noqa: E402
 from star.models import STARModel                # noqa: E402
 from star.utils import get_logger, seed_everything  # noqa: E402
@@ -51,7 +51,16 @@ def main():
         image_size=cfg.data.image_size, max_token=cfg.data.max_token, train=False,
     )
 
-    if cfg.data.group_by != "none":
+    if cfg.data.group_by == "pair":
+        pairs, groups = train_ds.pairs()
+        assert pairs, ("group_by=pair requires manifest columns image_id + pair_image_id "
+                       "(anchor rows carry the mined hard image id)")
+        sampler = PairBatchSampler(pairs, groups, cfg.train.batch_size, seed=cfg.train.seed)
+        log.info(f"PairBatchSampler: {len(pairs)} pairs -> {len(sampler)} batches/epoch "
+                 f"({cfg.train.batch_size // 2} video-distinct pairs/batch)")
+        train_loader = DataLoader(train_ds, batch_sampler=sampler, num_workers=cfg.data.num_workers,
+                                  collate_fn=collate_fn, pin_memory=True)
+    elif cfg.data.group_by != "none":
         sampler = GroupedBatchSampler(train_ds.group_ids(cfg.data.group_by), cfg.train.batch_size,
                                       cfg.data.group_fraction, seed=cfg.train.seed)
         train_loader = DataLoader(train_ds, batch_sampler=sampler, num_workers=cfg.data.num_workers,
