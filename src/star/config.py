@@ -140,6 +140,13 @@ def parse_overrides(pairs: list[str]) -> dict[str, Any]:
         try:
             val = ast.literal_eval(val)
         except (ValueError, SyntaxError):
-            pass
+            # ast.literal_eval doesn't know YAML/shell-style lowercase bools/null -> handle them,
+            # else `--set flag=false` becomes the STRING "false" (which is TRUTHY -> flag stays on).
+            low = val.strip().lower()
+            if low in ("true", "false"):
+                val = low == "true"
+            elif low in ("null", "none", "~"):
+                val = None
+            # otherwise keep as a plain string
         node[parts[-1]] = val
     return out
