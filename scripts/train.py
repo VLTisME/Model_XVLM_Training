@@ -30,6 +30,9 @@ def main():
     ap.add_argument("--config", required=True)
     ap.add_argument("--overfit-one-batch", action="store_true")
     ap.add_argument("--set", nargs="*", default=[], help="config overrides, e.g. optim.lr_lora=1e-4")
+    ap.add_argument("--resume", default=None, help="path to last.pth to continue a run across commits")
+    ap.add_argument("--max-hours", type=float, default=None,
+                    help="stop + save last.pth after N hours (keeps a Kaggle commit under the 9h limit)")
     args = ap.parse_args()
 
     cfg = load_config(args.config, parse_overrides(args.set))
@@ -71,9 +74,13 @@ def main():
                                   pin_memory=True, drop_last=True)
 
     trainer = Trainer(model, cfg, train_loader, val_ds, device)
+    if args.max_hours:
+        trainer.max_seconds = args.max_hours * 3600
     if args.overfit_one_batch:
         trainer.overfit_one_batch()
     else:
+        if args.resume:
+            trainer.resume_from(args.resume)
         trainer.train()
 
 

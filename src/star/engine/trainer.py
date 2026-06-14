@@ -28,9 +28,9 @@ class Trainer:
         self.val_dataset = val_dataset
         self.device = device
 
-        steps_per_epoch = max(1, len(train_loader) // cfg.train.grad_accum)
-        self.total_steps = steps_per_epoch * cfg.optim.epochs
-        warmup_steps = int(steps_per_epoch * cfg.optim.warmup_epochs)
+        self.steps_per_epoch = max(1, len(train_loader) // cfg.train.grad_accum)
+        self.total_steps = self.steps_per_epoch * cfg.optim.epochs
+        warmup_steps = int(self.steps_per_epoch * cfg.optim.warmup_epochs)
         self.optimizer = build_optimizer(model, cfg)
         self.scheduler = build_scheduler(self.optimizer, self.total_steps, warmup_steps)
 
@@ -47,8 +47,21 @@ class Trainer:
         self.best_metric = -1.0
         self.bad_evals = 0
         self.step = 0
+        self.start_epoch = 0
+        self.max_seconds = None     # set via train.py --max-hours: graceful stop so a commit finishes < 9h
 
     # ------------------------------------------------------------------ helpers
+    def resume_from(self, path: str) -> int:
+        """Restore model+optimizer+scheduler+step+best from a checkpoint (last.pth) to continue a run
+        ACROSS Kaggle commits. Returns the epoch to start from (derived from the saved step)."""
+        from ..utils.checkpoint import load_checkpoint
+        ckpt = load_checkpoint(path, self.model, self.optimizer, self.scheduler, map_location=self.device)
+        self.step = int(ckpt.get("step", 0))
+        self.best_metric = float(ckpt.get("best_metric", -1.0))
+        self.start_epoch = self.step // self.steps_per_epoch
+        log.info(f"[resume] {path}: step={self.step} best_mAP={self.best_metric:.4f} "
+                 f"-> tiep tu epoch {self.start_epoch}/{self.cfg.optim.epochs}")
+        return self.start_epoch
     def _to_device(self, batch: dict) -> dict:
         return {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
@@ -105,7 +118,7 @@ class Trainer:
         eval_every = max(1, int(len(self.train_loader) * self.cfg.train.eval_every_epochs))
         accum = self.cfg.train.grad_accum
         t0 = time.time()
-        for epoch in range(self.cfg.optim.epochs):
+        for epoch in range(self.start_epoch, self.cfg.optim.epochs):
             self.model.train()
             self.optimizer.zero_grad(set_to_none=True)
             for it, batch in enumerate(self.train_loader):
@@ -147,7 +160,12 @@ class Trainer:
                         log.info(msg)
 
                 if (it + 1) % eval_every == 0 and self.val_dataset is not None:
-                    if self._evaluate_and_maybe_stop():
+                    stop = self._evaluate_and_maybe_stop()             # saves last.pth (+ best.pth)
+                    if self.max_seconds and (time.time() - t0) > self.max_seconds:
+                        log.info(f"[time-stop] {(time.time()-t0)/3600:.2f}h vuot ngan sach -> da luu "
+                                 f"last.pth, dung de commit kip <9h (chay commit sau de tiep tuc).")
+                        return
+                    if stop:
                         log.info("Early stopping.")
                         return
         log.info(f"Training done in {(time.time()-t0)/60:.1f} min. best mAP={self.best_metric:.4f}")
