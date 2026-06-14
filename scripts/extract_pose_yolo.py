@@ -60,8 +60,9 @@ def pick_primary(boxes_xyxy, kpts_data):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--attr", required=True, help="attr.json (one json row per line)")
-    ap.add_argument("--image-root", required=True)
+    ap.add_argument("--attr", default=None, help="attr.json (one json row per line: image, image_id)")
+    ap.add_argument("--image-dir", default=None, help="instead of --attr: glob every image in a dir, image_id = file stem")
+    ap.add_argument("--image-root", default="")
     ap.add_argument("--out", required=True)
     ap.add_argument("--model", default="yolov8x-pose.pt")
     ap.add_argument("--device", default=None)
@@ -71,10 +72,17 @@ def main():
     from ultralytics import YOLO
 
     model = YOLO(args.model)
-    rows = [json.loads(l) for l in open(args.attr, encoding="utf-8")]
+    if args.image_dir:
+        files = [p for p in glob.glob(os.path.join(args.image_dir, "**", "*"), recursive=True)
+                 if p.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp"))]
+        rows = [{"image": p, "image_id": Path(p).stem} for p in files]
+        args.image_root = ""        # rows carry absolute paths
+    else:
+        assert args.attr, "can --attr hoac --image-dir"
+        rows = [json.loads(l) for l in open(args.attr, encoding="utf-8")]
     items, ok = {}, 0
     for r in rows:
-        p = Path(args.image_root) / r["image"]
+        p = Path(args.image_root) / r["image"] if args.image_root else Path(r["image"])
         with Image.open(p) as im:
             w, h = im.size
         res = model.predict(str(p), verbose=False, device=args.device)[0]
