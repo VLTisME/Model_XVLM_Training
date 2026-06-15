@@ -44,6 +44,22 @@ def test_hf_to_arrays_keypoints3d_conf_baked_in():
     assert kdata[0][0] == [2.0, 3.0, 0.8]
 
 
+def test_hf_to_arrays_handles_real_hf_torch_tensors():
+    # mimic HF VitPose post_process_pose_estimation per-person output: torch tensors, not lists
+    import torch
+    person = {"keypoints": torch.tensor([[float(i), float(i) + 1] for i in range(17)]),
+              "scores": torch.tensor([0.7] * 17),
+              "bbox": torch.tensor([1.0, 2.0, 3.0, 4.0]), "labels": torch.tensor(0)}
+    boxes, kdata = vp.hf_to_arrays([person])
+    assert len(kdata) == 1 and len(kdata[0]) == 17
+    assert kdata[0][0][:2] == [0.0, 1.0] and abs(kdata[0][0][2] - 0.7) < 1e-6   # x, y, conf -> python float
+    # flows through the formatters unchanged -> valid 51-flat item
+    kpts, box = ep.pick_primary(boxes, kdata)
+    it = ep.to_item(kpts, box, 64, 64)
+    assert it["status"] == "ok" and len(it["instances"][0]["keypoints_xyc"]) == 17
+    assert all(len(t) == 3 for t in it["instances"][0]["keypoints_xyc"])
+
+
 def test_hf_to_arrays_picks_largest_person():
     small = {"keypoints": [[float(i % 5), float(i % 5), 0.5] for i in range(17)]}   # extent 0..4
     big = {"keypoints": [[float(i * 6), float(i * 6), 0.9] for i in range(17)]}     # extent 0..96
