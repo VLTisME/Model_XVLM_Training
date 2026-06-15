@@ -83,7 +83,9 @@ def main():
                               VitPoseForPoseEstimation)
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    dt = torch.float16 if device == "cuda" else torch.float32
+    # float32: ViTPose post-processing (post_dark_unbiased_data_processing -> scipy.gaussian_filter)
+    # does NOT support float16 heatmaps. Both models are small -> float32 fits T4 easily.
+    dt = torch.float32
     det_proc = AutoProcessor.from_pretrained(args.detector)
     det = RTDetrForObjectDetection.from_pretrained(args.detector, torch_dtype=dt).to(device).eval()
     pose_proc = AutoProcessor.from_pretrained(args.pose_model)
