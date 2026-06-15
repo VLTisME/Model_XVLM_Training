@@ -26,6 +26,17 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+# X-VLM's BERT calls transformers.modeling_utils.apply_chunking_to_forward, which newer
+# transformers (>=4.x) moved out of modeling_utils -> shim it so pose-rerank runs regardless of
+# the env's transformers version (the inference notebook runs 4.34.1, which lacks it at this path;
+# the training env pins 4.12.5, which has it). Defensive: never block import if transformers is absent.
+try:
+    import transformers.modeling_utils as _mu             # noqa: E402
+    if not hasattr(_mu, "apply_chunking_to_forward"):
+        _mu.apply_chunking_to_forward = lambda fn, _cs, _cd, *t: fn(*t)
+except Exception:
+    pass
+
 from star.config import _merge, load_config              # noqa: E402
 from star.data import PABDataset                          # noqa: E402
 from star.inference import encode_eval_set                # noqa: E402
