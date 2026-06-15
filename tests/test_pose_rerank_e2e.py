@@ -30,7 +30,9 @@ def test_pose_rerank_end_to_end(tmp_path):
     from star.config import Config, to_dict
     from star.models import STARModel
 
-    ids = ["AAA", "BBB", "CCC", "DDD"]
+    ids = ["AAA", "BBB", "CCC", "DDD"]     # gallery image stems
+    qidx = ["q0", "q1", "q2", "q3"]        # query identities — deliberately NOT gallery stems
+                                           # (a text query has no image of its own) -> tests decoupling
 
     # ---- pose-ON dummy checkpoint (embedded cfg forces backbone=dummy on reload) ----
     cfg = Config()
@@ -50,12 +52,12 @@ def test_pose_rerank_end_to_end(tmp_path):
     for iid in ids:
         Image.new("RGB", (32, 32), (123, 116, 104)).save(img_root / f"{iid}.jpg")
 
-    # ---- query / answer / gt files ----
+    # ---- query / answer / gt files (query_index = qidx, GT = a gallery stem; the two differ) ----
     (tmp_path / "query_text.json").write_text(
-        "\n".join(json.dumps({"query_index": iid, "caption": f"a person number {k}"})
-                  for k, iid in enumerate(ids)), encoding="utf-8")
-    (tmp_path / "query_index.txt").write_text("\n".join(ids), encoding="utf-8")
-    (tmp_path / "ground_truth.txt").write_text("\n".join(ids), encoding="utf-8")   # GT = same-row id
+        "\n".join(json.dumps({"query_index": q, "caption": f"a person number {k}"})
+                  for k, q in enumerate(qidx)), encoding="utf-8")
+    (tmp_path / "query_index.txt").write_text("\n".join(qidx), encoding="utf-8")
+    (tmp_path / "ground_truth.txt").write_text("\n".join(ids), encoding="utf-8")   # query k's GT = gallery ids[k]
     # answer.txt: GT deliberately at rank-2 for each query (so re-rank has something to move)
     ans = []
     for i, iid in enumerate(ids):

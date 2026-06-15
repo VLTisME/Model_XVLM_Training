@@ -129,26 +129,31 @@ def main():
     assert model.pose is not None, "ckpt khong co pose branch -> khong the pose-rerank"
     del ck
 
-    # ---- manifest: gallery == query set (no-distractor); every image is a query+candidate ----
+    # ---- manifest: GALLERY rows (every image, pose-fused) + QUERY rows (captions only).
+    # A query is TEXT (no image of its own) -> query_index is NOT a gallery stem, so query rows reuse
+    # the first gallery image as a throwaway (deduped by image_id -> never stored twice; only the
+    # query's TEXT feature is used). gallery_ids = gallery stems, which is what answer.txt references.
     import pandas as pd
-    rows = []
-    for i, qid in enumerate(qorder):
-        p = stem2path.get(qid)
-        rows.append(dict(image_path=p if p else "", caption=cap_of.get(qid, ""), split="valb",
-                         sequence_id=f"o{qid}", scene=f"o{qid}", action="q",
-                         image_id=str(qid), bbox=None, keypoints=kpts_of(qid)))
     import tempfile
+    gallery_stems = sorted(stem2path)
+    assert gallery_stems, f"khong tim thay anh trong --image-root {args.image_root}"
+    ph = stem2path[gallery_stems[0]]                              # throwaway image for text-only queries
+    rows = [dict(image_path=stem2path[s], caption="", split="valb", sequence_id=s, scene=s,
+                 action="g", image_id=s, bbox=None, keypoints=kpts_of(s)) for s in gallery_stems]
+    rows += [dict(image_path=ph, caption=cap_of.get(q, ""), split="valb", sequence_id=f"q{i}",
+                  scene=f"q{i}", action="q", image_id=gallery_stems[0], bbox=None,
+                  keypoints=[0.0] * 51) for i, q in enumerate(qorder)]
     mani = os.path.join(tempfile.gettempdir(), "_pose_rerank.parquet")
     pd.DataFrame(rows).to_parquet(mani, index=False)
     ds = PABDataset(mani, args.image_root, model.backbone.tokenizer, split="valb",
                     image_size=cfg.data.image_size, max_token=cfg.data.max_token, train=False)
 
-    # ---- pose-ON cosine (encode_eval_set fuses pose because model.pose set + keypoints present) ----
+    # ---- pose-ON cosine (encode_eval_set fuses pose into the gallery image features) ----
     enc = encode_eval_set(model, ds, device, batch_size=64, num_workers=2)
-    sim = enc["txt_feats"] @ enc["gallery_feats"].t()             # [Q, G] POSE-ON
+    sim = enc["txt_feats"] @ enc["gallery_feats"].t()             # [Q, G] pose-ON
     gid = {g: j for j, g in enumerate(enc["gallery_ids"])}
-    qpos = {str(qorder[i]): i for i in range(len(qorder))}        # answer row -> ... but enc query order
-    # enc query order: encode_eval_set yields queries in manifest order = qorder order -> row i aligns
+    assert sim.size(0) == len(qorder), (f"query count lech {sim.size(0)} vs {len(qorder)} "
+                                        f"-- co caption rong trong query-json?")
     print(f"encoded: gallery={sim.size(1)} queries={sim.size(0)} (pose-ON cosine)")
 
     def rank_in(order, gt):
