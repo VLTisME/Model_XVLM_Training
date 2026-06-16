@@ -31,6 +31,10 @@ def main():
     ap.add_argument("--overfit-one-batch", action="store_true")
     ap.add_argument("--set", nargs="*", default=[], help="config overrides, e.g. optim.lr_lora=1e-4")
     ap.add_argument("--resume", default=None, help="path to last.pth to continue a run across commits")
+    ap.add_argument("--init-from", default=None,
+                    help="load model WEIGHTS ONLY from a checkpoint (fine-tune: fresh optimizer/"
+                         "scheduler/step, new LR + loss weights). Use this — not --resume — to "
+                         "continue from best.pth with a CHANGED recipe (e.g. higher lambda_itm).")
     ap.add_argument("--max-hours", type=float, default=None,
                     help="stop + save last.pth after N hours (keeps a Kaggle commit under the 9h limit)")
     args = ap.parse_args()
@@ -41,6 +45,11 @@ def main():
     log.info(f"device={device}")
 
     model = STARModel(cfg)
+    if args.init_from:                                  # fine-tune: nap weight, KHONG nap optimizer/step
+        from star.utils.checkpoint import load_checkpoint
+        msg = load_checkpoint(args.init_from, model)    # strict=False; bo qua optimizer/scheduler
+        log.info(f"[init-from] loaded weights from {args.init_from} "
+                 f"(best_metric was {msg.get('best_metric')}) -> fresh optimizer/scheduler/step")
     tokenizer = model.backbone.tokenizer
 
     train_ds = PABDataset(
