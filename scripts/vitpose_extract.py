@@ -26,23 +26,22 @@ import os
 import sys
 from pathlib import Path
 
-# reuse the YOLO extractor's formatters so the json schema is byte-for-byte the same contract
+# Reuse the YOLO extractor's formatters so the JSON schema stays the same contract.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from extract_pose_yolo import empty_item, pick_primary, to_item   # noqa: E402
+from extract_pose_yolo import empty_item, to_item   # noqa: E402
 
 _EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 
 
-def hf_to_arrays(pose_result):
+def hf_to_arrays(pose_result, det_boxes_xyxy, det_scores):
     """HF post_process_pose_estimation per-image result (list of person dicts) ->
     (boxes_xyxy [n,4], kdata [n,17,3]) for pick_primary. PURE -> unit-testable without models.
 
     Tolerant to schema drift across transformers versions: keypoints may be [17,2] (+ a separate
-    'scores' list) or [17,3] (conf baked in). The box is derived from the KEYPOINT EXTENT, not the
-    detector bbox -- it is only used to pick the largest person, and the extent is unambiguous
-    across versions (sidesteps the xyxy-vs-xywh bbox ambiguity entirely)."""
-    boxes, kdata = [], []
-    for person in pose_result:
+    'scores' list) or [17,3] (conf baked in). Person boxes/scores come from the same RT-DETR
+    detector used before ViTPose, matching the preprocessing extractor's primary-person rule."""
+    boxes, scores, kdata = [], [], []
+    for i, person in enumerate(pose_result):
         kp = person["keypoints"]
         sc = person.get("scores")
         triples, xs, ys = [], [], []
@@ -50,9 +49,26 @@ def hf_to_arrays(pose_result):
             x, y = float(kp[j][0]), float(kp[j][1])
             c = float(sc[j]) if sc is not None else (float(kp[j][2]) if len(kp[j]) > 2 else 1.0)
             triples.append([x, y, c]); xs.append(x); ys.append(y)
-        boxes.append([min(xs), min(ys), max(xs), max(ys)] if xs else [0.0, 0.0, 0.0, 0.0])
+        if i < len(det_boxes_xyxy):
+            boxes.append([float(v) for v in det_boxes_xyxy[i]])
+        else:
+            boxes.append([min(xs), min(ys), max(xs), max(ys)] if xs else [0.0, 0.0, 0.0, 0.0])
+        scores.append(float(det_scores[i]) if i < len(det_scores) else 0.0)
         kdata.append(triples)
-    return boxes, kdata
+    return boxes, scores, kdata
+
+
+def pick_primary_by_det_score_area(boxes_xyxy, det_scores, kpts_data):
+    """Match preprocessing: primary person = max(det_score * detector_bbox_area)."""
+    if kpts_data is None or len(kpts_data) == 0:
+        return None
+    best, best_score = 0, -1.0
+    for i, b in enumerate(boxes_xyxy):
+        area = max(0.0, float(b[2]) - float(b[0])) * max(0.0, float(b[3]) - float(b[1]))
+        score = (float(det_scores[i]) if i < len(det_scores) else 0.0) * max(area, 1.0)
+        if score > best_score:
+            best, best_score = i, score
+    return [list(map(float, kp)) for kp in kpts_data[best]], [float(v) for v in boxes_xyxy[best]]
 
 
 def _rows_from_args(args):
@@ -103,7 +119,9 @@ def main():
             do = det(**di)
         dres = det_proc.post_process_object_detection(
             do, target_sizes=torch.tensor([(h, w)]).to(device), threshold=args.det_threshold)[0]
-        pboxes = dres["boxes"][dres["labels"] == 0]          # xyxy, pixels
+        person_mask = dres["labels"] == 0
+        pboxes = dres["boxes"][person_mask]          # xyxy, pixels
+        pscores = dres["scores"][person_mask]
         if pboxes.numel() == 0:
             items[str(r["image_id"])] = empty_item(w, h); continue
         # xyxy -> xywh for the pose processor
@@ -116,8 +134,8 @@ def main():
         with torch.no_grad():
             po = pose(**pi)
         pres = pose_proc.post_process_pose_estimation(po, boxes=[boxes_np])[0]
-        bxyxy, kdata = hf_to_arrays(pres)
-        pick = pick_primary(bxyxy, kdata)
+        bxyxy, dscores, kdata = hf_to_arrays(pres, pboxes.detach().cpu().tolist(), pscores.detach().cpu().tolist())
+        pick = pick_primary_by_det_score_area(bxyxy, dscores, kdata)
         if pick is None:
             items[str(r["image_id"])] = empty_item(w, h)
         else:
