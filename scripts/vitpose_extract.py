@@ -82,6 +82,22 @@ def _rows_from_args(args):
     return [json.loads(l) for l in open(args.attr, encoding="utf-8")]
 
 
+def _write_json_atomic(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _load_items(path):
+    path = Path(path)
+    if not path.exists():
+        return {}
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    return obj.get("items", {})
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--attr", default=None, help="attr.json (one json row per line: image, image_id)")
@@ -94,6 +110,14 @@ def main():
     ap.add_argument("--device", default=None)
     ap.add_argument("--progress-every", type=int, default=50,
                     help="print progress every N images; 0 disables progress logs")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="process only the first N images for smoke tests")
+    ap.add_argument("--resume", action="store_true",
+                    help="resume from --out or its partial JSON if present")
+    ap.add_argument("--save-every", type=int, default=500,
+                    help="write partial JSON every N newly processed images; 0 disables")
+    ap.add_argument("--partial-out", default=None,
+                    help="partial JSON path; default is <out>.partial.json")
     args = ap.parse_args()
 
     import torch
@@ -111,11 +135,35 @@ def main():
     pose = VitPoseForPoseEstimation.from_pretrained(args.pose_model, torch_dtype=dt).to(device).eval()
 
     rows = _rows_from_args(args)
+    if args.limit is not None:
+        rows = rows[:max(args.limit, 0)]
     print(f"images: {len(rows)} | device: {device} | detector: {args.detector} | pose: {args.pose_model}",
           flush=True)
-    items, ok = {}, 0
+    out_path = Path(args.out)
+    partial_path = Path(args.partial_out) if args.partial_out else out_path.with_suffix(".partial.json")
+    items = {}
+    if args.resume:
+        resume_path = out_path if out_path.exists() else partial_path
+        items = _load_items(resume_path)
+        if items:
+            print(f"resume: loaded {len(items):,} existing items from {resume_path}", flush=True)
+    ok = sum(1 for item in items.values() if item.get("status") == "ok")
+    skipped = 0
+    newly_processed = 0
     t0 = time.time()
     for idx, r in enumerate(rows, start=1):
+        image_id = str(r["image_id"])
+        if image_id in items:
+            skipped += 1
+            if args.progress_every and (idx % args.progress_every == 0 or idx == len(rows)):
+                elapsed = max(time.time() - t0, 1e-6)
+                done = skipped + newly_processed
+                speed = done / elapsed
+                remaining = (len(rows) - done) / max(speed, 1e-6)
+                print(f"pose processed {done:,}/{len(rows):,}; skipped {skipped:,}; ok {ok:,}; "
+                      f"{speed:.2f} img/s; eta {remaining / 60:.1f} min",
+                      flush=True)
+            continue
         p = Path(args.image_root) / r["image"] if args.image_root else Path(r["image"])
         image = Image.open(p).convert("RGB")
         w, h = image.size
@@ -129,34 +177,42 @@ def main():
         pboxes = dres["boxes"][person_mask]          # xyxy, pixels
         pscores = dres["scores"][person_mask]
         if pboxes.numel() == 0:
-            items[str(r["image_id"])] = empty_item(w, h); continue
-        # xyxy -> xywh for the pose processor
-        boxes_xywh = pboxes.detach().clone().float()
-        boxes_xywh[:, 2] -= boxes_xywh[:, 0]
-        boxes_xywh[:, 3] -= boxes_xywh[:, 1]
-        boxes_np = boxes_xywh.cpu().numpy()
-        # ---- stage 2: ViTPose on each box ----
-        pi = pose_proc(image, boxes=[boxes_np], return_tensors="pt").to(device, dt)
-        with torch.no_grad():
-            po = pose(**pi)
-        pres = pose_proc.post_process_pose_estimation(po, boxes=[boxes_np])[0]
-        bxyxy, dscores, kdata = hf_to_arrays(pres, pboxes.detach().cpu().tolist(), pscores.detach().cpu().tolist())
-        pick = pick_primary_by_det_score_area(bxyxy, dscores, kdata)
-        if pick is None:
-            items[str(r["image_id"])] = empty_item(w, h)
+            items[image_id] = empty_item(w, h)
         else:
-            kpts, box = pick
-            items[str(r["image_id"])] = to_item(kpts, box, w, h)
-            ok += 1
+            # xyxy -> xywh for the pose processor
+            boxes_xywh = pboxes.detach().clone().float()
+            boxes_xywh[:, 2] -= boxes_xywh[:, 0]
+            boxes_xywh[:, 3] -= boxes_xywh[:, 1]
+            boxes_np = boxes_xywh.cpu().numpy()
+            # ---- stage 2: ViTPose on each box ----
+            pi = pose_proc(image, boxes=[boxes_np], return_tensors="pt").to(device, dt)
+            with torch.no_grad():
+                po = pose(**pi)
+            pres = pose_proc.post_process_pose_estimation(po, boxes=[boxes_np])[0]
+            bxyxy, dscores, kdata = hf_to_arrays(pres, pboxes.detach().cpu().tolist(), pscores.detach().cpu().tolist())
+            pick = pick_primary_by_det_score_area(bxyxy, dscores, kdata)
+            if pick is None:
+                items[image_id] = empty_item(w, h)
+            else:
+                kpts, box = pick
+                items[image_id] = to_item(kpts, box, w, h)
+                ok += 1
+        newly_processed += 1
+        if args.save_every and newly_processed % args.save_every == 0:
+            _write_json_atomic(partial_path, {"items": items, "meta": {
+                "detector": args.detector, "pose_model": args.pose_model,
+                "n": len(rows), "ok": ok, "partial": True}})
         if args.progress_every and (idx % args.progress_every == 0 or idx == len(rows)):
             elapsed = max(time.time() - t0, 1e-6)
-            speed = idx / elapsed
-            remaining = (len(rows) - idx) / max(speed, 1e-6)
-            print(f"pose processed {idx:,}/{len(rows):,}; ok {ok:,}; "
+            done = skipped + newly_processed
+            speed = done / elapsed
+            remaining = (len(rows) - done) / max(speed, 1e-6)
+            print(f"pose processed {done:,}/{len(rows):,}; skipped {skipped:,}; ok {ok:,}; "
                   f"{speed:.2f} img/s; eta {remaining / 60:.1f} min",
                   flush=True)
-    Path(args.out).write_text(json.dumps({"items": items, "meta": {
-        "detector": args.detector, "pose_model": args.pose_model, "n": len(rows), "ok": ok}}))
+    _write_json_atomic(out_path, {"items": items, "meta": {
+        "detector": args.detector, "pose_model": args.pose_model,
+        "n": len(rows), "ok": ok, "skipped": skipped}})
     print(f"wrote {args.out}: {ok}/{len(rows)} images with a detected person "
           f"({ok / max(len(rows), 1):.0%} coverage)")
 

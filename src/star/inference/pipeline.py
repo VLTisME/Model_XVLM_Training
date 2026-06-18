@@ -1,12 +1,12 @@
 """STAR-v3 inference pipeline (per inference2.svg, trimmed to the agreed core):
 
-    encode (GLOBAL images, no LHP, no pose) -> Stage-1 ITC cosine -> (2) Top-K filter
-        -> (3) cross-encoder ITM re-rank (BLIP-style: itm_logit + cosine)
-        -> (5) Gale-Shapley 1-1 rank-1 assignment -> top-10 / query
+    encode (GLOBAL images, optional pose fusion, no LHP) -> Stage-1 ITC cosine
+        -> (2) Top-K filter -> (3) cross-encoder ITM re-rank
+        -> optional SCA / Gale-Shapley rank-1 postprocess -> top-10 / query
 
-Dropped per decision: (1) Sinkhorn/DBSN, (4) ensemble, GNN/k-reciprocal (optional), ViTPose.
-Metrics are reported at EVERY stage (cosine / +rerank / +GS) so each block's contribution
-is measured, not assumed.
+Dropped per decision: (1) Sinkhorn/DBSN, (4) ensemble, GNN/k-reciprocal.
+Metrics are reported at every old-test stage (cosine / +rerank / +SCA / +GS) so each
+block's contribution is measured, not assumed. Official submit mode skips GT metrics.
 
 Memory design: gallery region embeddings ([G, Ni, H]) are cached on CPU in fp16
 (~4 GB for 13.7K images) and gathered per rerank chunk; everything else is tiny.
@@ -20,9 +20,20 @@ Rank bookkeeping (exact, no approximation):
 """
 from __future__ import annotations
 
+import time
+
 import torch
 from torch import Tensor
 from torch.utils.data import DataLoader
+
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - tqdm is optional in tiny test envs
+    tqdm = None
+
+
+def _progress(iterable, **kwargs):
+    return tqdm(iterable, **kwargs) if tqdm is not None else iterable
 
 
 # --------------------------------------------------------------------------- encoding
@@ -65,7 +76,7 @@ def encode_eval_set(model, dataset, device, batch_size: int = 64, num_workers: i
     g_feats, g_embeds, g_ids = [], [], []
     q_tfeats, q_tembeds, q_masks, q_img_ids = [], [], [], []
 
-    for batch in loader:
+    for batch in _progress(loader, desc="encode images/text", total=len(loader), leave=False):
         image = batch["image"].to(device, non_blocking=True)
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
             img_embeds, img_feat = model.backbone.encode_image(image)
@@ -118,7 +129,9 @@ def itm_rerank(model, gallery_embeds: Tensor, txt_embeds: Tensor, txt_masks: Ten
     use_amp = "cuda" in str(device)
     Q, K = topk_idx.shape
     out = torch.empty(Q, K)
-    for qi in range(Q):
+    total_pairs = Q * K
+    t0 = time.time()
+    for qi in _progress(range(Q), desc=f"ITM rerank {total_pairs:,} pairs", leave=True):
         t_emb = txt_embeds[qi].to(device)
         t_mask = txt_masks[qi].to(device)
         idx = topk_idx[qi]
@@ -130,6 +143,15 @@ def itm_rerank(model, gallery_embeds: Tensor, txt_embeds: Tensor, txt_masks: Ten
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
                 logits = model.backbone.itm_logits(img, te, tm)          # [c, 2]
             out[qi, s:s + len(sel)] = logits.float()[:, 1].cpu()
+        if tqdm is None and ((qi + 1) % 25 == 0 or qi + 1 == Q):
+            done_pairs = (qi + 1) * K
+            elapsed = max(time.time() - t0, 1e-6)
+            speed = done_pairs / elapsed
+            eta = (total_pairs - done_pairs) / max(speed, 1e-6)
+            print(f"ITM rerank {qi + 1:,}/{Q:,} queries "
+                  f"({done_pairs:,}/{total_pairs:,} pairs); "
+                  f"{speed:.1f} pairs/s; eta {eta / 60:.1f} min",
+                  flush=True)
     return out
 
 
@@ -148,6 +170,123 @@ def ranks_after_rerank(sim: Tensor, topk_idx: Tensor, final_scores: Tensor,
             ranks[qi] = int(hit[0]) + 1          # GT inside K-block -> new position
         # else: only the K items above it were permuted -> stage-1 rank unchanged
     return ranks, new_order
+
+
+def scores_for_order(topk_idx: Tensor, final_scores: Tensor, order: Tensor) -> Tensor:
+    """Gather final_scores so they align with an arbitrary top-K order."""
+    out = torch.empty_like(order, dtype=final_scores.dtype)
+    for qi in range(order.size(0)):
+        score_by_gid = {int(g): float(s) for g, s in zip(topk_idx[qi], final_scores[qi])}
+        out[qi] = torch.tensor([score_by_gid[int(g)] for g in order[qi]],
+                               dtype=final_scores.dtype)
+    return out
+
+
+def ranks_after_order(order: Tensor, gt_pos: Tensor, ranks_fallback: Tensor) -> Tensor:
+    """Exact GT ranks after a top-K order. GT outside K keeps the fallback rank."""
+    ranks = ranks_fallback.clone()
+    for qi in range(order.size(0)):
+        hit = (order[qi] == gt_pos[qi]).nonzero(as_tuple=True)[0]
+        if len(hit):
+            ranks[qi] = int(hit[0]) + 1
+    return ranks
+
+
+def build_top10(order: Tensor, sim: Tensor, gallery_ids: list[str]) -> list[list[str]]:
+    """Top-10 = chosen K-block order followed by the original ITC tail."""
+    s1_order = sim.argsort(dim=1, descending=True)
+    top10 = []
+    for q in range(order.size(0)):
+        seen = order[q].tolist()
+        seen_set = set(seen)
+        tail = [int(g) for g in s1_order[q] if int(g) not in seen_set]
+        full = (seen + tail)[:10]
+        top10.append([gallery_ids[g] for g in full])
+    return top10
+
+
+def greedy_sca(order: Tensor, scores: Tensor, query_feats: Tensor | None = None,
+               max_iter: int = 10, text_sim_threshold: float = 0.96,
+               swap_gain: float = 0.01) -> tuple[Tensor, Tensor]:
+    """Similarity Coverage Analysis style postprocess.
+
+    This is intentionally conservative:
+      1) resolve duplicate rank-1 claims by keeping the highest-confidence query;
+      2) for very similar queries with crossed top candidates, accept a swap only when
+         the pairwise score sum improves. It is an ablation stage, not the default submit
+         choice unless it beats Gale-Shapley on old-test.
+    """
+    Q, K = order.shape
+    assigned = order[:, 0].clone()
+
+    for _ in range(max_iter):
+        changed = False
+        holders: dict[int, list[int]] = {}
+        for q, gid in enumerate(assigned.tolist()):
+            holders.setdefault(int(gid), []).append(q)
+        occupied = set(int(x) for x in assigned.tolist())
+        for gid, qs in holders.items():
+            if len(qs) <= 1:
+                continue
+            qs = sorted(qs, key=lambda q: float(scores[q, 0]), reverse=True)
+            for q in qs[1:]:
+                old = int(assigned[q])
+                replacement = None
+                for cand in order[q].tolist():
+                    cand = int(cand)
+                    if cand == old:
+                        continue
+                    if cand not in occupied:
+                        replacement = cand
+                        break
+                if replacement is None:
+                    for cand in order[q].tolist():
+                        cand = int(cand)
+                        if cand != old:
+                            replacement = cand
+                            break
+                if replacement is not None and replacement != old:
+                    assigned[q] = replacement
+                    occupied.discard(old)
+                    occupied.add(replacement)
+                    changed = True
+        if not changed:
+            break
+
+    if query_feats is not None and Q > 1:
+        feats = torch.nn.functional.normalize(query_feats.float(), dim=1)
+        qsim = feats @ feats.t()
+        score_lookup = []
+        pos_lookup = []
+        for q in range(Q):
+            score_lookup.append({int(g): float(s) for g, s in zip(order[q], scores[q])})
+            pos_lookup.append({int(g): i for i, g in enumerate(order[q].tolist())})
+        for i in range(Q):
+            for j in range(i + 1, Q):
+                if float(qsim[i, j]) < text_sim_threshold:
+                    continue
+                ai, aj = int(assigned[i]), int(assigned[j])
+                if ai == aj:
+                    continue
+                if aj not in score_lookup[i] or ai not in score_lookup[j]:
+                    continue
+                if pos_lookup[i][aj] > 2 or pos_lookup[j][ai] > 2:
+                    continue
+                current = score_lookup[i][ai] + score_lookup[j][aj]
+                swapped = score_lookup[i][aj] + score_lookup[j][ai]
+                if swapped > current + swap_gain:
+                    tmp = int(assigned[i])
+                    assigned[i] = assigned[j]
+                    assigned[j] = tmp
+
+    new_order = order.clone()
+    for q in range(Q):
+        chosen = int(assigned[q])
+        row = order[q].tolist()
+        if chosen in row:
+            new_order[q] = torch.tensor([chosen] + [x for x in row if int(x) != chosen],
+                                        dtype=order.dtype)
+    return new_order, assigned
 
 
 # --------------------------------------------------------------------------- (5) Gale-Shapley
@@ -271,13 +410,17 @@ def report_from_ranks(ranks: Tensor, ks=(1, 5, 10)) -> dict[str, float]:
 @torch.no_grad()
 def run_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
                  num_workers: int = 2, use_gale_shapley: bool = True,
-                 pair_chunk: int = 50, pairwise_head=None, pairwise_topn: int = 10) -> dict:
+                 pair_chunk: int = 50, pairwise_head=None, pairwise_topn: int = 10,
+                 use_sca: bool = True) -> dict:
     """Full inference. Returns stage-wise reports + final top-10 per query.
 
     If `pairwise_head` (a trained PairwiseHead) is given, a 'pairwise' stage reorders the top-N of
     the ITM order by a round-robin tournament and RRF-fuses it back — measured independently.
     """
+    print(f"[1/5] Encoding eval set | rows={len(dataset):,} batch={batch_size}", flush=True)
     enc = encode_eval_set(model, dataset, device, batch_size, num_workers)
+    print(f"      encoded gallery={len(enc['gallery_ids']):,} queries={enc['txt_feats'].size(0):,}", flush=True)
+    print("[2/5] Computing ITC cosine + Top-K", flush=True)
     sim = enc["txt_feats"] @ enc["gallery_feats"].t()                    # [Q, G]
     K = min(topk, sim.size(1))
 
@@ -285,6 +428,8 @@ def run_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
     rep1 = report_from_ranks(ranks1)
 
     topk_sim, topk_idx = sim.topk(K, dim=1)
+    print(f"[3/5] Cross-encoder ITM rerank | queries={sim.size(0):,} K={K} "
+          f"pairs={sim.size(0) * K:,} chunk={pair_chunk}", flush=True)
     itm = itm_rerank(model, enc["gallery_embeds"], enc["txt_embeds"], enc["txt_masks"],
                      topk_idx, device, pair_chunk)
     final = itm + topk_sim                                                # BLIP: logit + cosine
@@ -296,6 +441,7 @@ def run_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
     # (pairwise / duo) reorder the top-N of the ITM order via the comparator, RRF-fused
     order_pw, ranks_pw = order2, ranks2
     if pairwise_head is not None:
+        print("[4/5] Pairwise rerank", flush=True)
         N = min(pairwise_topn, K)
         feats = pairwise_features(model, enc["gallery_embeds"], enc["txt_embeds"],
                                   enc["txt_masks"], order2[:, :N], device)
@@ -314,9 +460,20 @@ def run_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
         ranks_out["pairwise"] = ranks_pw
 
     base_order, base_ranks = order_pw, ranks_pw          # GS runs on the best order so far
+    base_scores = scores_for_order(topk_idx, final, base_order)
+
+    if use_sca:
+        print("[4/5] Greedy SCA ablation", flush=True)
+        order_sca, _ = greedy_sca(base_order, base_scores, query_feats=enc["txt_feats"])
+        ranks_sca = ranks_after_order(order_sca, enc["gt_pos"], ranks1)
+        reports["greedy_sca"] = report_from_ranks(ranks_sca)
+        ranks_out["greedy_sca"] = ranks_sca
+    else:
+        order_sca = base_order
+
     if use_gale_shapley:
-        scores2 = torch.gather(final, 1, final.argsort(dim=1, descending=True))
-        matched = gale_shapley_match(order2, scores2)
+        print("[5/5] Gale-Shapley stable matching", flush=True)
+        matched = gale_shapley_match(base_order, base_scores)
         ranks3, order3 = apply_gale_shapley(base_order, matched, base_ranks, enc["gt_pos"])
         rep3 = report_from_ranks(ranks3)
     else:
@@ -325,13 +482,67 @@ def run_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
     ranks_out["final"] = ranks3
 
     # top-10 = reranked K-block first, then the stage-1 tail (items outside the block keep
+    print("      building final top-10", flush=True)
     # their cosine order) — matters when topk < 10 and is the correct general semantics
-    s1_order = sim.argsort(dim=1, descending=True)
-    top10 = []
-    for q in range(order3.size(0)):
-        seen = order3[q].tolist()
-        tail = [int(g) for g in s1_order[q] if int(g) not in set(seen)]
-        full = (seen + tail)[:10]
-        top10.append([enc["gallery_ids"][g] for g in full])
+    top10_by_stage = {
+        "rerank": build_top10(order2, sim, enc["gallery_ids"]),
+        "greedy_sca": build_top10(order_sca, sim, enc["gallery_ids"]),
+        "gale_shapley": build_top10(order3, sim, enc["gallery_ids"]),
+    }
+    top10 = top10_by_stage["gale_shapley" if use_gale_shapley else "rerank"]
     return dict(**reports, ranks=ranks_out,
-                top10=top10, gallery_size=sim.size(1), num_queries=sim.size(0), topk=K)
+                top10=top10, top10_by_stage=top10_by_stage,
+                gallery_size=sim.size(1), num_queries=sim.size(0), topk=K)
+
+
+@torch.no_grad()
+def run_submit_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
+                        num_workers: int = 2, pair_chunk: int = 50,
+                        postprocess: str = "gale_shapley") -> dict:
+    """No-GT inference path for the official hidden/test set.
+
+    Returns top-10 image ids without computing rank metrics. `postprocess` is one of:
+    "rerank", "greedy_sca", "gale_shapley".
+    """
+    if postprocess not in {"rerank", "greedy_sca", "gale_shapley"}:
+        raise ValueError("postprocess must be one of: rerank, greedy_sca, gale_shapley")
+
+    print(f"[1/5] Encoding submit set | rows={len(dataset):,} batch={batch_size}", flush=True)
+    enc = encode_eval_set(model, dataset, device, batch_size, num_workers)
+    print(f"      encoded gallery={len(enc['gallery_ids']):,} queries={enc['txt_feats'].size(0):,}", flush=True)
+    print("[2/5] Computing ITC cosine + Top-K", flush=True)
+    sim = enc["txt_feats"] @ enc["gallery_feats"].t()
+    K = min(topk, sim.size(1))
+    topk_sim, topk_idx = sim.topk(K, dim=1)
+
+    print(f"[3/5] Cross-encoder ITM rerank | queries={sim.size(0):,} K={K} "
+          f"pairs={sim.size(0) * K:,} chunk={pair_chunk}", flush=True)
+    itm = itm_rerank(model, enc["gallery_embeds"], enc["txt_embeds"], enc["txt_masks"],
+                     topk_idx, device, pair_chunk)
+    final = itm + topk_sim
+    order_in_k = final.argsort(dim=1, descending=True)
+    order_rerank = torch.gather(topk_idx, 1, order_in_k)
+    scores_rerank = torch.gather(final, 1, order_in_k)
+
+    print("[4/5] Greedy SCA candidate", flush=True)
+    order_sca, _ = greedy_sca(order_rerank, scores_rerank, query_feats=enc["txt_feats"])
+
+    print("[5/5] Gale-Shapley candidate", flush=True)
+    matched = gale_shapley_match(order_rerank, scores_rerank)
+    dummy_ranks = torch.ones(order_rerank.size(0), dtype=torch.long)
+    dummy_gt = torch.full((order_rerank.size(0),), -1, dtype=torch.long)
+    _, order_gs = apply_gale_shapley(order_rerank, matched, dummy_ranks, dummy_gt)
+
+    top10_by_stage = {
+        "rerank": build_top10(order_rerank, sim, enc["gallery_ids"]),
+        "greedy_sca": build_top10(order_sca, sim, enc["gallery_ids"]),
+        "gale_shapley": build_top10(order_gs, sim, enc["gallery_ids"]),
+    }
+    return {
+        "top10": top10_by_stage[postprocess],
+        "top10_by_stage": top10_by_stage,
+        "postprocess": postprocess,
+        "gallery_size": sim.size(1),
+        "num_queries": sim.size(0),
+        "topk": K,
+    }

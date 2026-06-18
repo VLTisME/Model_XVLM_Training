@@ -9,6 +9,7 @@ from .pipeline import (
     report_from_ranks,
     rrf_fuse,
     run_pipeline,
+    run_submit_pipeline,
     stage1_ranks,
 )
 
@@ -24,4 +25,5 @@ __all__ = [
     "rrf_fuse",
     "report_from_ranks",
     "run_pipeline",
+    "run_submit_pipeline",
 ]
