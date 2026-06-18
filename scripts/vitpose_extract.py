@@ -24,6 +24,7 @@ import glob
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 # Reuse the YOLO extractor's formatters so the JSON schema stays the same contract.
@@ -91,6 +92,8 @@ def main():
     ap.add_argument("--pose-model", default="usyd-community/vitpose-base-simple", help="HF ViTPose")
     ap.add_argument("--det-threshold", type=float, default=0.3)
     ap.add_argument("--device", default=None)
+    ap.add_argument("--progress-every", type=int, default=50,
+                    help="print progress every N images; 0 disables progress logs")
     args = ap.parse_args()
 
     import torch
@@ -108,8 +111,11 @@ def main():
     pose = VitPoseForPoseEstimation.from_pretrained(args.pose_model, torch_dtype=dt).to(device).eval()
 
     rows = _rows_from_args(args)
+    print(f"images: {len(rows)} | device: {device} | detector: {args.detector} | pose: {args.pose_model}",
+          flush=True)
     items, ok = {}, 0
-    for r in rows:
+    t0 = time.time()
+    for idx, r in enumerate(rows, start=1):
         p = Path(args.image_root) / r["image"] if args.image_root else Path(r["image"])
         image = Image.open(p).convert("RGB")
         w, h = image.size
@@ -142,6 +148,13 @@ def main():
             kpts, box = pick
             items[str(r["image_id"])] = to_item(kpts, box, w, h)
             ok += 1
+        if args.progress_every and (idx % args.progress_every == 0 or idx == len(rows)):
+            elapsed = max(time.time() - t0, 1e-6)
+            speed = idx / elapsed
+            remaining = (len(rows) - idx) / max(speed, 1e-6)
+            print(f"pose processed {idx:,}/{len(rows):,}; ok {ok:,}; "
+                  f"{speed:.2f} img/s; eta {remaining / 60:.1f} min",
+                  flush=True)
     Path(args.out).write_text(json.dumps({"items": items, "meta": {
         "detector": args.detector, "pose_model": args.pose_model, "n": len(rows), "ok": ok}}))
     print(f"wrote {args.out}: {ok}/{len(rows)} images with a detected person "
