@@ -23,8 +23,9 @@ class DataConfig:
     lhp_min_scale: float = 0.5
     lhp_use_bbox: bool = True
     # smart sampler
-    group_by: str = "scene"          # "scene" | "action" | "none"
+    group_by: str = "scene"          # "scene" | "action" | "none" | "pair" | "pair_mixed"
     group_fraction: float = 0.5       # fraction of batch drawn from one group
+    pair_hard_pairs: int = 4          # for group_by=pair_mixed: mined hard pairs per batch
     num_workers: int = 8
 
 

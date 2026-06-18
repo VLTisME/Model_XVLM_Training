@@ -2,7 +2,7 @@
 import pandas as pd
 import pytest
 
-from star.data import PairBatchSampler
+from star.data import PairBatchSampler, PairMixedBatchSampler
 
 
 def test_batches_contain_full_pairs_and_distinct_groups():
@@ -58,3 +58,21 @@ def test_dataset_pairs_mapping():
     pairs, groups = ds.pairs()
     assert pairs == [(0, 1), (2, 3)]             # missing-partner anchor skipped
     assert groups == [1, 2]                      # grouped by video_id
+
+
+def test_pair_mixed_sampler_uses_fixed_hard_pairs_and_fillers():
+    pairs = [(0, 1), (2, 3), (4, 5), (6, 7)]
+    groups = ["A", "B", "C", "D"]
+    sampler = PairMixedBatchSampler(pairs, groups, batch_size=8, hard_pairs=2, num_samples=12, seed=7)
+    batch = next(iter(sampler))
+
+    assert len(batch) == 8
+    assert len(set(batch)) == 8
+    assert (batch[0], batch[1]) in pairs
+    assert (batch[2], batch[3]) in pairs
+    assert batch[4:]                              # remaining slots are random fillers
+
+
+def test_pair_mixed_rejects_too_many_pairs_for_batch_size():
+    with pytest.raises(ValueError):
+        PairMixedBatchSampler([(0, 1)], ["A"], batch_size=7, hard_pairs=4, num_samples=10)

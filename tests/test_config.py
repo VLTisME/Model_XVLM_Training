@@ -26,3 +26,25 @@ def test_override_false_actually_disables_flag_end_to_end():
                       parse_overrides(["data.lhp_enabled=false", "model.lora_enabled=false"]))
     assert cfg.data.lhp_enabled is False and not cfg.data.lhp_enabled
     assert cfg.model.lora_enabled is False and not cfg.model.lora_enabled
+
+
+def test_pair_mixed_first_rerun_overrides():
+    cfg = load_config(
+        "configs/star_v3_10k_kaggle.yaml",
+        parse_overrides([
+            "data.group_by=pair_mixed",
+            "data.pair_hard_pairs=4",
+            "data.lhp_enabled=false",
+            "model.pose_enabled=true",
+            "loss.lambda_itm=2.0",
+            "loss.lambda_smooth_ap=0.2",
+            "model.lora_freeze_text=true",
+        ]),
+    )
+    assert cfg.data.group_by == "pair_mixed"
+    assert cfg.data.pair_hard_pairs == 4
+    assert cfg.data.lhp_enabled is False
+    assert cfg.model.pose_enabled is True
+    assert cfg.loss.lambda_itm == 2.0
+    assert cfg.loss.lambda_smooth_ap == 0.2
+    assert cfg.model.lora_freeze_text is True

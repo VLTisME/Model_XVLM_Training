@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from star.config import load_config, parse_overrides  # noqa: E402
-from star.data import GroupedBatchSampler, PABDataset, PairBatchSampler, collate_fn  # noqa: E402
+from star.data import GroupedBatchSampler, PABDataset, PairBatchSampler, PairMixedBatchSampler, collate_fn  # noqa: E402
 from star.engine import Trainer                  # noqa: E402
 from star.models import STARModel                # noqa: E402
 from star.utils import get_logger, seed_everything  # noqa: E402
@@ -70,6 +70,23 @@ def main():
         sampler = PairBatchSampler(pairs, groups, cfg.train.batch_size, seed=cfg.train.seed)
         log.info(f"PairBatchSampler: {len(pairs)} pairs -> {len(sampler)} batches/epoch "
                  f"({cfg.train.batch_size // 2} video-distinct pairs/batch)")
+        train_loader = DataLoader(train_ds, batch_sampler=sampler, num_workers=cfg.data.num_workers,
+                                  collate_fn=collate_fn, pin_memory=True)
+    elif cfg.data.group_by == "pair_mixed":
+        pairs, groups = train_ds.pairs()
+        assert pairs, ("group_by=pair_mixed requires manifest columns image_id + pair_image_id "
+                       "(anchor rows carry the mined hard image id)")
+        sampler = PairMixedBatchSampler(
+            pairs,
+            groups,
+            cfg.train.batch_size,
+            hard_pairs=cfg.data.pair_hard_pairs,
+            num_samples=len(train_ds),
+            seed=cfg.train.seed,
+        )
+        log.info(f"PairMixedBatchSampler: {len(pairs)} pairs -> {len(sampler)} batches/epoch "
+                 f"({cfg.data.pair_hard_pairs} hard pairs/batch, "
+                 f"{cfg.train.batch_size - 2 * cfg.data.pair_hard_pairs} random fillers/batch)")
         train_loader = DataLoader(train_ds, batch_sampler=sampler, num_workers=cfg.data.num_workers,
                                   collate_fn=collate_fn, pin_memory=True)
     elif cfg.data.group_by != "none":

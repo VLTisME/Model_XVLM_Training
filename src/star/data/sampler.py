@@ -151,3 +151,119 @@ class PairBatchSampler(Sampler[list[int]]):
                 yield flush()
         if chosen and not self.drop_last:
             yield flush()
+
+
+class PairMixedBatchSampler(Sampler[list[int]]):
+    """Batches with a fixed small number of mined hard pairs plus random fillers.
+
+    `PairBatchSampler` intentionally spends the whole batch on hard pairs. This sampler is
+    gentler for the ITC/ITM mix: each batch starts with exactly `hard_pairs` flattened
+    `(anchor, partner)` pairs, then fills the remaining slots with random unique rows.
+    """
+
+    def __init__(
+        self,
+        pairs,
+        anchor_groups,
+        batch_size: int,
+        hard_pairs: int = 4,
+        num_samples: int | None = None,
+        drop_last: bool = True,
+        seed: int = 0,
+    ):
+        if len(pairs) != len(anchor_groups):
+            raise ValueError("pairs and anchor_groups must have the same length")
+        if hard_pairs < 0:
+            raise ValueError("hard_pairs must be >= 0")
+        if 2 * hard_pairs > batch_size:
+            raise ValueError("batch_size must be at least 2 * hard_pairs")
+
+        self.pairs = list(pairs)
+        self.groups = list(anchor_groups)
+        self.batch_size = batch_size
+        self.hard_pairs = hard_pairs
+        self.drop_last = drop_last
+        self.seed = seed
+        self._epoch = 0
+
+        if num_samples is None:
+            max_pair_idx = max((max(a, p) for a, p in self.pairs), default=-1)
+            num_samples = max_pair_idx + 1
+        self.num_samples = int(num_samples)
+        if self.hard_pairs and not self.pairs:
+            raise ValueError("pair_mixed needs at least one pair when hard_pairs > 0")
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return self.num_samples // self.batch_size
+        return (self.num_samples + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self) -> Iterator[list[int]]:
+        rng = random.Random(self.seed + self._epoch)
+        self._epoch += 1
+
+        def shuffled_deque(values):
+            values = list(values)
+            rng.shuffle(values)
+            return deque(values)
+
+        pair_queue = shuffled_deque(range(len(self.pairs)))
+        filler_queue = shuffled_deque(range(self.num_samples))
+
+        def refill_pairs() -> None:
+            pair_queue.extend(shuffled_deque(range(len(self.pairs))))
+
+        def refill_fillers() -> None:
+            filler_queue.extend(shuffled_deque(range(self.num_samples)))
+
+        total = len(self)
+        for _ in range(total):
+            batch: list[int] = []
+            used: set[int] = set()
+            used_groups: set = set()
+            chosen_pairs = 0
+            pair_attempts = 0
+            max_pair_attempts = max(100, len(self.pairs) * 4)
+
+            while chosen_pairs < self.hard_pairs and pair_attempts < max_pair_attempts:
+                pair_attempts += 1
+                if not pair_queue:
+                    refill_pairs()
+                pi = pair_queue.popleft()
+                a, p = self.pairs[pi]
+                if a in used or p in used or a == p:
+                    continue
+
+                group = self.groups[pi]
+                if group in used_groups and pair_attempts < len(self.pairs):
+                    pair_queue.append(pi)
+                    continue
+
+                batch.extend((a, p))
+                used.add(a)
+                used.add(p)
+                used_groups.add(group)
+                chosen_pairs += 1
+
+            if chosen_pairs != self.hard_pairs:
+                raise RuntimeError(
+                    f"Could not build a batch with exactly {self.hard_pairs} hard pairs "
+                    f"from {len(self.pairs)} available pairs."
+                )
+
+            filler_attempts = 0
+            max_filler_attempts = max(100, self.num_samples * 4)
+            while len(batch) < self.batch_size and filler_attempts < max_filler_attempts:
+                filler_attempts += 1
+                if not filler_queue:
+                    refill_fillers()
+                idx = filler_queue.popleft()
+                if idx in used:
+                    continue
+                batch.append(idx)
+                used.add(idx)
+
+            if len(batch) == self.batch_size:
+                yield batch
+            elif not self.drop_last and batch:
+                yield batch
