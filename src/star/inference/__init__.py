@@ -2,6 +2,7 @@ from .pipeline import (
     apply_gale_shapley,
     encode_eval_set,
     gale_shapley_match,
+    apply_sinkhorn_or_dbsn,
     itm_rerank,
     pairwise_features,
     pairwise_rerank,
@@ -10,6 +11,7 @@ from .pipeline import (
     rrf_fuse,
     run_pipeline,
     run_submit_pipeline,
+    sinkhorn_normalize,
     stage1_ranks,
 )
 
@@ -19,6 +21,7 @@ __all__ = [
     "stage1_ranks",
     "ranks_after_rerank",
     "gale_shapley_match",
+    "apply_sinkhorn_or_dbsn",
     "apply_gale_shapley",
     "pairwise_features",
     "pairwise_rerank",
@@ -26,4 +29,5 @@ __all__ = [
     "report_from_ranks",
     "run_pipeline",
     "run_submit_pipeline",
+    "sinkhorn_normalize",
 ]

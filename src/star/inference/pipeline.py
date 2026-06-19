@@ -120,6 +120,48 @@ def stage1_ranks(sim: Tensor, gt_pos: Tensor) -> Tensor:
     return greater + ties + 1
 
 
+# --------------------------------------------------------------------------- optional Sinkhorn / DBSN
+def sinkhorn_normalize(sim: Tensor, epsilon: float = 0.05, max_iter: int = 20) -> Tensor:
+    """Balanced assignment-style normalization over a query-gallery score matrix.
+
+    Returns normalized scores with the same shape as `sim`. This is used only before Top-K.
+    """
+    z = sim.float() / max(float(epsilon), 1e-6)
+    z = z - z.max()
+    p = torch.exp(z).clamp_min(1e-12)
+    for _ in range(max_iter):
+        p = p / p.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        p = p / p.sum(dim=0, keepdim=True).clamp_min(1e-12)
+    return p
+
+
+def apply_sinkhorn_or_dbsn(sim: Tensor, gallery_feats: Tensor, query_bank_path: str | None = None,
+                           mode: str = "sinkhorn", epsilon: float = 0.05,
+                           max_iter: int = 20) -> Tensor:
+    """Apply plain Sinkhorn or DBSN-style normalization.
+
+    DBSN mode stacks an external query bank above the current query matrix while balancing,
+    then returns the normalized rows corresponding to the current queries.
+    """
+    mode = str(mode).lower()
+    if mode not in {"sinkhorn", "dbsn"}:
+        raise ValueError("mode must be 'sinkhorn' or 'dbsn'")
+    if mode == "sinkhorn":
+        return sinkhorn_normalize(sim, epsilon=epsilon, max_iter=max_iter)
+
+    if not query_bank_path:
+        raise ValueError("DBSN mode requires query_bank_path")
+    payload = torch.load(query_bank_path, map_location="cpu")
+    bank = payload.get("query_bank")
+    if bank is None:
+        raise KeyError(f"query_bank not found in {query_bank_path}")
+    bank = bank.float()
+    bank_sim = bank @ gallery_feats.float().t()
+    combined = torch.cat([sim.float(), bank_sim], dim=0)
+    normalized = sinkhorn_normalize(combined, epsilon=epsilon, max_iter=max_iter)
+    return normalized[:sim.size(0)]
+
+
 # --------------------------------------------------------------------------- (3) rerank
 @torch.no_grad()
 def itm_rerank(model, gallery_embeds: Tensor, txt_embeds: Tensor, txt_masks: Tensor,
@@ -411,7 +453,9 @@ def report_from_ranks(ranks: Tensor, ks=(1, 5, 10)) -> dict[str, float]:
 def run_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
                  num_workers: int = 2, use_gale_shapley: bool = True,
                  pair_chunk: int = 50, pairwise_head=None, pairwise_topn: int = 10,
-                 use_sca: bool = True) -> dict:
+                 use_sca: bool = True, use_sinkhorn: bool = False,
+                 sinkhorn_mode: str = "sinkhorn", query_bank_path: str | None = None,
+                 sinkhorn_epsilon: float = 0.05, sinkhorn_max_iter: int = 20) -> dict:
     """Full inference. Returns stage-wise reports + final top-10 per query.
 
     If `pairwise_head` (a trained PairwiseHead) is given, a 'pairwise' stage reorders the top-N of
@@ -422,6 +466,14 @@ def run_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
     print(f"      encoded gallery={len(enc['gallery_ids']):,} queries={enc['txt_feats'].size(0):,}", flush=True)
     print("[2/5] Computing ITC cosine + Top-K", flush=True)
     sim = enc["txt_feats"] @ enc["gallery_feats"].t()                    # [Q, G]
+    if use_sinkhorn:
+        print(f"      applying {sinkhorn_mode} normalization "
+              f"(epsilon={sinkhorn_epsilon}, iter={sinkhorn_max_iter})", flush=True)
+        sim = apply_sinkhorn_or_dbsn(sim, enc["gallery_feats"],
+                                     query_bank_path=query_bank_path,
+                                     mode=sinkhorn_mode,
+                                     epsilon=sinkhorn_epsilon,
+                                     max_iter=sinkhorn_max_iter)
     K = min(topk, sim.size(1))
 
     ranks1 = stage1_ranks(sim, enc["gt_pos"])
@@ -498,7 +550,12 @@ def run_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
 @torch.no_grad()
 def run_submit_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
                         num_workers: int = 2, pair_chunk: int = 50,
-                        postprocess: str = "gale_shapley") -> dict:
+                        postprocess: str = "gale_shapley",
+                        use_sinkhorn: bool = False,
+                        sinkhorn_mode: str = "sinkhorn",
+                        query_bank_path: str | None = None,
+                        sinkhorn_epsilon: float = 0.05,
+                        sinkhorn_max_iter: int = 20) -> dict:
     """No-GT inference path for the official hidden/test set.
 
     Returns top-10 image ids without computing rank metrics. `postprocess` is one of:
@@ -512,6 +569,14 @@ def run_submit_pipeline(model, dataset, device, topk: int = 100, batch_size: int
     print(f"      encoded gallery={len(enc['gallery_ids']):,} queries={enc['txt_feats'].size(0):,}", flush=True)
     print("[2/5] Computing ITC cosine + Top-K", flush=True)
     sim = enc["txt_feats"] @ enc["gallery_feats"].t()
+    if use_sinkhorn:
+        print(f"      applying {sinkhorn_mode} normalization "
+              f"(epsilon={sinkhorn_epsilon}, iter={sinkhorn_max_iter})", flush=True)
+        sim = apply_sinkhorn_or_dbsn(sim, enc["gallery_feats"],
+                                     query_bank_path=query_bank_path,
+                                     mode=sinkhorn_mode,
+                                     epsilon=sinkhorn_epsilon,
+                                     max_iter=sinkhorn_max_iter)
     K = min(topk, sim.size(1))
     topk_sim, topk_idx = sim.topk(K, dim=1)
 
