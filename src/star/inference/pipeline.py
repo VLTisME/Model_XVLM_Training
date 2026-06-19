@@ -4,7 +4,7 @@
         -> (2) Top-K filter -> (3) cross-encoder ITM re-rank
         -> optional SCA / Gale-Shapley rank-1 postprocess -> top-10 / query
 
-Dropped per decision: (1) Sinkhorn/DBSN, (4) ensemble, GNN/k-reciprocal.
+Dropped per decision: (4) ensemble, GNN/k-reciprocal. Sinkhorn/DBSN is optional.
 Metrics are reported at every old-test stage (cosine / +rerank / +SCA / +GS) so each
 block's contribution is measured, not assumed. Official submit mode skips GT metrics.
 
@@ -21,6 +21,7 @@ Rank bookkeeping (exact, no approximation):
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
 from torch import Tensor
@@ -164,36 +165,101 @@ def apply_sinkhorn_or_dbsn(sim: Tensor, gallery_feats: Tensor, query_bank_path: 
 
 # --------------------------------------------------------------------------- (3) rerank
 @torch.no_grad()
-def itm_rerank(model, gallery_embeds: Tensor, txt_embeds: Tensor, txt_masks: Tensor,
-               topk_idx: Tensor, device, pair_chunk: int = 50) -> Tensor:
-    """ITM logit[:,1] for each (query, top-K image) pair. Returns [Q, K] fp32 cpu."""
+def _itm_rerank_worker(model, gallery_embeds: Tensor, txt_embeds: Tensor, txt_masks: Tensor,
+                       topk_idx: Tensor, q_indices: list[int], device,
+                       pair_chunk: int = 50, label: str = "gpu",
+                       progress_every: int = 50) -> tuple[list[int], Tensor]:
+    """Worker for a query shard. Returns scores in the same order as q_indices."""
     model.eval()
+    device = torch.device(device)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
     use_amp = "cuda" in str(device)
+    K = topk_idx.size(1)
+    out = torch.empty(len(q_indices), K)
+    total_pairs = len(q_indices) * K
+    t0 = time.time()
+    with torch.no_grad():
+        iterator = enumerate(q_indices)
+        if len(q_indices) and tqdm is not None and len(q_indices) == topk_idx.size(0):
+            iterator = enumerate(_progress(q_indices, desc=f"ITM rerank {total_pairs:,} pairs", leave=True))
+        for local_i, qi in iterator:
+            t_emb = txt_embeds[qi].to(device)
+            t_mask = txt_masks[qi].to(device)
+            idx = topk_idx[qi]
+            for s in range(0, K, pair_chunk):
+                sel = idx[s:s + pair_chunk]
+                img = gallery_embeds[sel].to(device).float()             # [c, Ni, H]
+                te = t_emb.unsqueeze(0).expand(img.size(0), -1, -1)
+                tm = t_mask.unsqueeze(0).expand(img.size(0), -1)
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                    logits = model.backbone.itm_logits(img, te, tm)      # [c, 2]
+                out[local_i, s:s + len(sel)] = logits.float()[:, 1].cpu()
+            if progress_every and ((local_i + 1) % progress_every == 0 or local_i + 1 == len(q_indices)):
+                done_pairs = (local_i + 1) * K
+                elapsed = max(time.time() - t0, 1e-6)
+                speed = done_pairs / elapsed
+                eta = (total_pairs - done_pairs) / max(speed, 1e-6)
+                print(f"{label} ITM rerank {local_i + 1:,}/{len(q_indices):,} queries "
+                      f"({done_pairs:,}/{total_pairs:,} pairs); "
+                      f"{speed:.1f} pairs/s; eta {eta / 60:.1f} min",
+                      flush=True)
+    return q_indices, out
+
+
+def _normalize_rerank_models(model, device, rerank_models):
+    if not rerank_models:
+        return [(model, torch.device(device))]
+    specs = []
+    for item in rerank_models:
+        if isinstance(item, dict):
+            m = item["model"]
+            d = torch.device(item.get("device", next(m.parameters()).device))
+        else:
+            m, d = item
+            d = torch.device(d)
+        specs.append((m, d))
+    return specs
+
+
+@torch.no_grad()
+def itm_rerank(model, gallery_embeds: Tensor, txt_embeds: Tensor, txt_masks: Tensor,
+               topk_idx: Tensor, device, pair_chunk: int = 50,
+               rerank_models=None) -> Tensor:
+    """ITM logit[:,1] for each (query, top-K image) pair. Returns [Q, K] fp32 cpu.
+
+    `rerank_models` may be a list of `(model, device)` pairs. When provided, queries are
+    sharded across those models, which is the intended 2xT4 Kaggle speedup path.
+    """
+    specs = _normalize_rerank_models(model, device, rerank_models)
     Q, K = topk_idx.shape
     out = torch.empty(Q, K)
-    total_pairs = Q * K
-    t0 = time.time()
-    for qi in _progress(range(Q), desc=f"ITM rerank {total_pairs:,} pairs", leave=True):
-        t_emb = txt_embeds[qi].to(device)
-        t_mask = txt_masks[qi].to(device)
-        idx = topk_idx[qi]
-        for s in range(0, K, pair_chunk):
-            sel = idx[s:s + pair_chunk]
-            img = gallery_embeds[sel].to(device).float()                 # [c, Ni, H]
-            te = t_emb.unsqueeze(0).expand(img.size(0), -1, -1)
-            tm = t_mask.unsqueeze(0).expand(img.size(0), -1)
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-                logits = model.backbone.itm_logits(img, te, tm)          # [c, 2]
-            out[qi, s:s + len(sel)] = logits.float()[:, 1].cpu()
-        if tqdm is None and ((qi + 1) % 25 == 0 or qi + 1 == Q):
-            done_pairs = (qi + 1) * K
-            elapsed = max(time.time() - t0, 1e-6)
-            speed = done_pairs / elapsed
-            eta = (total_pairs - done_pairs) / max(speed, 1e-6)
-            print(f"ITM rerank {qi + 1:,}/{Q:,} queries "
-                  f"({done_pairs:,}/{total_pairs:,} pairs); "
-                  f"{speed:.1f} pairs/s; eta {eta / 60:.1f} min",
-                  flush=True)
+    if len(specs) <= 1:
+        q_indices, scores = _itm_rerank_worker(
+            specs[0][0], gallery_embeds, txt_embeds, txt_masks, topk_idx,
+            list(range(Q)), specs[0][1], pair_chunk=pair_chunk,
+            label=str(specs[0][1]), progress_every=25,
+        )
+        out[q_indices] = scores
+        return out
+
+    shards = [list(range(i, Q, len(specs))) for i in range(len(specs))]
+    print("ITM multi-GPU rerank:",
+          ", ".join(f"{device}:{len(qs):,}q" for (_, device), qs in zip(specs, shards)),
+          flush=True)
+    with ThreadPoolExecutor(max_workers=len(specs)) as pool:
+        futures = []
+        for worker_i, ((m, d), q_indices) in enumerate(zip(specs, shards)):
+            if not q_indices:
+                continue
+            futures.append(pool.submit(
+                _itm_rerank_worker,
+                m, gallery_embeds, txt_embeds, txt_masks, topk_idx,
+                q_indices, d, pair_chunk, f"gpu{worker_i}:{d}", 50,
+            ))
+        for fut in as_completed(futures):
+            q_indices, scores = fut.result()
+            out[q_indices] = scores
     return out
 
 
@@ -455,7 +521,8 @@ def run_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
                  pair_chunk: int = 50, pairwise_head=None, pairwise_topn: int = 10,
                  use_sca: bool = True, use_sinkhorn: bool = False,
                  sinkhorn_mode: str = "sinkhorn", query_bank_path: str | None = None,
-                 sinkhorn_epsilon: float = 0.05, sinkhorn_max_iter: int = 20) -> dict:
+                 sinkhorn_epsilon: float = 0.05, sinkhorn_max_iter: int = 20,
+                 rerank_models=None) -> dict:
     """Full inference. Returns stage-wise reports + final top-10 per query.
 
     If `pairwise_head` (a trained PairwiseHead) is given, a 'pairwise' stage reorders the top-N of
@@ -483,7 +550,7 @@ def run_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
     print(f"[3/5] Cross-encoder ITM rerank | queries={sim.size(0):,} K={K} "
           f"pairs={sim.size(0) * K:,} chunk={pair_chunk}", flush=True)
     itm = itm_rerank(model, enc["gallery_embeds"], enc["txt_embeds"], enc["txt_masks"],
-                     topk_idx, device, pair_chunk)
+                     topk_idx, device, pair_chunk, rerank_models=rerank_models)
     final = itm + topk_sim                                                # BLIP: logit + cosine
     ranks2, order2 = ranks_after_rerank(sim, topk_idx, final, enc["gt_pos"], ranks1)
     rep2 = report_from_ranks(ranks2)
@@ -555,7 +622,8 @@ def run_submit_pipeline(model, dataset, device, topk: int = 100, batch_size: int
                         sinkhorn_mode: str = "sinkhorn",
                         query_bank_path: str | None = None,
                         sinkhorn_epsilon: float = 0.05,
-                        sinkhorn_max_iter: int = 20) -> dict:
+                        sinkhorn_max_iter: int = 20,
+                        rerank_models=None) -> dict:
     """No-GT inference path for the official hidden/test set.
 
     Returns top-10 image ids without computing rank metrics. `postprocess` is one of:
@@ -583,7 +651,7 @@ def run_submit_pipeline(model, dataset, device, topk: int = 100, batch_size: int
     print(f"[3/5] Cross-encoder ITM rerank | queries={sim.size(0):,} K={K} "
           f"pairs={sim.size(0) * K:,} chunk={pair_chunk}", flush=True)
     itm = itm_rerank(model, enc["gallery_embeds"], enc["txt_embeds"], enc["txt_masks"],
-                     topk_idx, device, pair_chunk)
+                     topk_idx, device, pair_chunk, rerank_models=rerank_models)
     final = itm + topk_sim
     order_in_k = final.argsort(dim=1, descending=True)
     order_rerank = torch.gather(topk_idx, 1, order_in_k)
