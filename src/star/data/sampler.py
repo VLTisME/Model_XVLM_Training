@@ -43,6 +43,7 @@ class GroupedBatchSampler(Sampler[list[int]]):
         self.drop_last = drop_last
         self.seed = seed
         self.n = len(group_ids)
+        self._epoch = 0
         self.groups: dict = defaultdict(list)
         for idx, g in enumerate(group_ids):
             self.groups[g].append(idx)
@@ -52,7 +53,8 @@ class GroupedBatchSampler(Sampler[list[int]]):
         return self.n // self.batch_size
 
     def __iter__(self) -> Iterator[list[int]]:
-        rng = random.Random(self.seed)
+        rng = random.Random(self.seed + self._epoch)
+        self._epoch += 1
         all_idx = list(range(self.n))
         rng.shuffle(all_idx)
         n_group = int(round(self.batch_size * self.group_fraction))
@@ -77,6 +79,9 @@ class GroupedBatchSampler(Sampler[list[int]]):
                     batch.append(next(pool))
             yield batch[: self.batch_size]
             produced += 1
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
 
 
 class PairBatchSampler(Sampler[list[int]]):
@@ -152,6 +157,9 @@ class PairBatchSampler(Sampler[list[int]]):
         if chosen and not self.drop_last:
             yield flush()
 
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
+
 
 class PairMixedBatchSampler(Sampler[list[int]]):
     """Batches with a fixed small number of mined hard pairs plus random fillers.
@@ -194,6 +202,10 @@ class PairMixedBatchSampler(Sampler[list[int]]):
             raise ValueError("pair_mixed needs at least one pair when hard_pairs > 0")
 
     def __len__(self) -> int:
+        if self.hard_pairs * 2 == self.batch_size:
+            if self.drop_last:
+                return len(self.pairs) // self.hard_pairs
+            return (len(self.pairs) + self.hard_pairs - 1) // self.hard_pairs
         if self.drop_last:
             return self.num_samples // self.batch_size
         return (self.num_samples + self.batch_size - 1) // self.batch_size
@@ -267,3 +279,6 @@ class PairMixedBatchSampler(Sampler[list[int]]):
                 yield batch
             elif not self.drop_last and batch:
                 yield batch
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)

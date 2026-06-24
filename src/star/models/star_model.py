@@ -15,7 +15,13 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
-from ..losses import ITCLoss, ITMLoss, SmoothAPLoss, build_itm_pairs
+from ..losses import (
+    ITCLoss,
+    ITMLoss,
+    SmoothAPLoss,
+    build_explicit_itm_pairs,
+    build_itm_pairs,
+)
 from ..losses.weighting import build_weighter
 from .backbone import build_backbone
 from .lora import count_trainable, mark_only_lora_trainable
@@ -86,11 +92,33 @@ class STARModel(nn.Module):
             temp = self.itc.temp.detach().clamp(min=1e-3)
             sim_i2t = (img_feat @ txt_feat.t()) / temp
             forbid = inst[:, None] == inst[None, :]          # same instance => not a negative
-        pairs = build_itm_pairs(sim_i2t, dup_mask=forbid, temperature=1.0)
+        partner = batch.get("partner_index")
+        if partner is not None and bool((partner >= 0).all()):
+            pairs = build_explicit_itm_pairs(partner)
+        else:
+            pairs = build_itm_pairs(sim_i2t, dup_mask=forbid, temperature=1.0)
         itm_logits = self.backbone.itm_logits(
             img_embeds[pairs["img_idx"]], txt_embeds[pairs["txt_idx"]], mask[pairs["txt_idx"]]
         )
         loss_itm = self.itm(itm_logits, pairs["label"])
+
+        with torch.no_grad():
+            raw_sim = img_feat @ txt_feat.t()
+            diag = torch.arange(n, device=device)
+            positive_similarity = raw_sim.diag().mean()
+            if partner is not None and bool((partner >= 0).all()):
+                paired_hard_similarity = raw_sim[diag, partner].mean()
+            else:
+                paired_hard_similarity = raw_sim.masked_fill(forbid, -1).max(dim=1).values.mean()
+            random_similarity = (
+                raw_sim[diag, torch.roll(diag, 1)].mean()
+                if n > 1
+                else raw_sim.new_zeros(())
+            )
+            predicted = itm_logits.argmax(dim=1)
+            itm_positive_accuracy = (predicted[:n] == 1).float().mean()
+            itm_hard_text_accuracy = (predicted[n : 2 * n] == 0).float().mean()
+            itm_hard_image_accuracy = (predicted[2 * n : 3 * n] == 0).float().mean()
 
         # ---- total: weighter combines the tasks (fixed: w_itc*ITC + λ1*ITM + λ2*SmoothAP) ----
         total = self.weighter({"itc": loss_itc, "itm": loss_itm, "smap": loss_smap})
@@ -101,6 +129,13 @@ class STARModel(nn.Module):
             "loss_itc": loss_itc,
             "loss_itm": loss_itm,
             "loss_smap": loss_smap,
+            "positive_similarity": positive_similarity,
+            "paired_hard_similarity": paired_hard_similarity,
+            "random_negative_similarity": random_similarity,
+            "itm_positive_accuracy": itm_positive_accuracy,
+            "itm_hard_text_accuracy": itm_hard_text_accuracy,
+            "itm_hard_image_accuracy": itm_hard_image_accuracy,
+            "temperature": self.itc.temp.detach(),
         }
 
     @torch.no_grad()

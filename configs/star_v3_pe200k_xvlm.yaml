@@ -1,0 +1,67 @@
+data:
+  manifest: manifests/train_200k_hard_448.parquet
+  image_root: data
+  image_size: 384
+  max_token: 100
+  lhp_enabled: true
+  lhp_use_bbox: true
+  pair_consistent_aug: true
+  motion_blur_p: 0.25
+  jpeg_p: 0.35
+  downscale_p: 0.30
+  color_jitter_p: 0.30
+  noise_p: 0.15
+  erase_p: 0.20
+  max_aug_ops: 2
+  group_by: pair_mixed
+  pair_hard_pairs: -1
+  num_workers: 24
+  prefetch_factor: 4
+  persistent_workers: true
+
+model:
+  backbone: xvlm
+  checkpoint: null
+  embed_dim: 256
+  lora_enabled: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_targets: [query, value]
+  lora_freeze_text: true
+  pose_enabled: false
+
+loss:
+  w_itc: 1.0
+  lambda_itm: 2.0
+  lambda_smooth_ap: 0.2
+  weighting: fixed
+  itc_temp_init: 0.07
+  smooth_ap_temp: 0.01
+
+optim:
+  lr_lora: 1.0e-4
+  lr_head: 2.0e-4
+  weight_decay: 0.05
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  grad_clip: 1.0
+  warmup_epochs: 0.25
+  epochs: 5
+
+train:
+  batch_size: 64
+  grad_accum: 2
+  amp_dtype: bf16
+  grad_checkpointing: true
+  eval_every_epochs: 0.5
+  early_stop_patience: 4
+  grad_norm_every: 200
+  seed: 2026
+  out_dir: outputs/star_v3_pe200k_xvlm
+  log_wandb: false
+  log_every_steps: 25
+  log_jsonl: true
+  log_tensorboard: true
+  log_nvml: true
+  best_r10_max_drop: 0.002

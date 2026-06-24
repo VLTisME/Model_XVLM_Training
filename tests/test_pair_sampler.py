@@ -76,3 +76,19 @@ def test_pair_mixed_sampler_uses_fixed_hard_pairs_and_fillers():
 def test_pair_mixed_rejects_too_many_pairs_for_batch_size():
     with pytest.raises(ValueError):
         PairMixedBatchSampler([(0, 1)], ["A"], batch_size=7, hard_pairs=4, num_samples=10)
+
+
+def test_pair_mixed_full_pair_mode_covers_every_pair_once():
+    pairs = [(i * 2, i * 2 + 1) for i in range(12)]
+    groups = list(range(12))
+    sampler = PairMixedBatchSampler(
+        pairs, groups, batch_size=6, hard_pairs=3, num_samples=24, seed=3
+    )
+    batches = list(sampler)
+    assert len(batches) == len(sampler) == 4
+    seen = {
+        (batch[position], batch[position + 1])
+        for batch in batches
+        for position in range(0, len(batch), 2)
+    }
+    assert seen == set(pairs)

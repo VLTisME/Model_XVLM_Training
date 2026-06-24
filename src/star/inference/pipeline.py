@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import torch
 from torch import Tensor
@@ -108,7 +109,37 @@ def encode_eval_set(model, dataset, device, batch_size: int = 64, num_workers: i
     masks = torch.cat(q_masks)                                  # [Q, L]
     gt_pos = torch.tensor([id_to_pos[i] for i in q_img_ids])    # [Q]
     return dict(gallery_feats=gallery_feats, gallery_embeds=gallery_embeds, gallery_ids=g_ids,
-                txt_feats=txt_feats, txt_embeds=txt_embeds, txt_masks=masks, gt_pos=gt_pos)
+                txt_feats=txt_feats, txt_embeds=txt_embeds, txt_masks=masks, gt_pos=gt_pos,
+                query_image_ids=q_img_ids)
+
+
+def load_stage1_features(payload, enc: dict) -> tuple[Tensor, Tensor]:
+    """Load PE features and reorder them to the X-VLM gallery/query order."""
+    if payload is None:
+        return enc["gallery_feats"], enc["txt_feats"]
+    if isinstance(payload, (str, bytes, Path)):
+        try:
+            payload = torch.load(payload, map_location="cpu", weights_only=False)
+        except TypeError:
+            payload = torch.load(payload, map_location="cpu")
+    gallery_pos = {str(value): i for i, value in enumerate(payload["gallery_ids"])}
+    query_positions: dict[str, list[int]] = {}
+    for i, value in enumerate(payload["query_image_ids"]):
+        query_positions.setdefault(str(value), []).append(i)
+    query_cursor = {key: 0 for key in query_positions}
+    try:
+        gallery_order = [gallery_pos[str(value)] for value in enc["gallery_ids"]]
+        query_order = []
+        for value in enc["query_image_ids"]:
+            key = str(value)
+            cursor = query_cursor[key]
+            query_order.append(query_positions[key][cursor])
+            query_cursor[key] += 1
+    except (KeyError, IndexError) as exc:
+        raise ValueError("PE stage-1 payload does not match the X-VLM manifest order/IDs") from exc
+    gallery = payload["gallery_feats"][gallery_order].float()
+    text = payload["txt_feats"][query_order].float()
+    return gallery, text
 
 
 # --------------------------------------------------------------------------- stage 1
@@ -152,7 +183,10 @@ def apply_sinkhorn_or_dbsn(sim: Tensor, gallery_feats: Tensor, query_bank_path: 
 
     if not query_bank_path:
         raise ValueError("DBSN mode requires query_bank_path")
-    payload = torch.load(query_bank_path, map_location="cpu")
+    try:
+        payload = torch.load(query_bank_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(query_bank_path, map_location="cpu")
     bank = payload.get("query_bank")
     if bank is None:
         raise KeyError(f"query_bank not found in {query_bank_path}")
@@ -311,6 +345,11 @@ def build_top10(order: Tensor, sim: Tensor, gallery_ids: list[str]) -> list[list
         full = (seen + tail)[:10]
         top10.append([gallery_ids[g] for g in full])
     return top10
+
+
+def top1_conflict_count(order: Tensor) -> int:
+    top1 = order[:, 0]
+    return int(top1.numel() - torch.unique(top1).numel())
 
 
 def greedy_sca(order: Tensor, scores: Tensor, query_feats: Tensor | None = None,
@@ -506,7 +545,7 @@ def rrf_fuse(orders: list[list[int]], k: int = 60) -> list[int]:
 
 
 # --------------------------------------------------------------------------- reporting
-def report_from_ranks(ranks: Tensor, ks=(1, 5, 10)) -> dict[str, float]:
+def report_from_ranks(ranks: Tensor, ks=(1, 5, 10, 50, 200)) -> dict[str, float]:
     r = ranks.float()
     rep = {"mAP": float((1.0 / r).mean()), "MRR": float((1.0 / r).mean())}
     for k in ks:
@@ -516,13 +555,14 @@ def report_from_ranks(ranks: Tensor, ks=(1, 5, 10)) -> dict[str, float]:
 
 # --------------------------------------------------------------------------- orchestrator
 @torch.no_grad()
-def run_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
+def run_pipeline(model, dataset, device, topk: int = 200, batch_size: int = 64,
                  num_workers: int = 2, use_gale_shapley: bool = True,
                  pair_chunk: int = 50, pairwise_head=None, pairwise_topn: int = 10,
                  use_sca: bool = True, use_sinkhorn: bool = False,
                  sinkhorn_mode: str = "sinkhorn", query_bank_path: str | None = None,
                  sinkhorn_epsilon: float = 0.05, sinkhorn_max_iter: int = 20,
-                 rerank_models=None) -> dict:
+                 rerank_models=None, stage1_payload=None,
+                 stage1_weight: float = 1.0, itm_weight: float = 1.0) -> dict:
     """Full inference. Returns stage-wise reports + final top-10 per query.
 
     If `pairwise_head` (a trained PairwiseHead) is given, a 'pairwise' stage reorders the top-N of
@@ -532,11 +572,15 @@ def run_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
     enc = encode_eval_set(model, dataset, device, batch_size, num_workers)
     print(f"      encoded gallery={len(enc['gallery_ids']):,} queries={enc['txt_feats'].size(0):,}", flush=True)
     print("[2/5] Computing ITC cosine + Top-K", flush=True)
-    sim = enc["txt_feats"] @ enc["gallery_feats"].t()                    # [Q, G]
+    stage1_gallery, stage1_text = load_stage1_features(stage1_payload, enc)
+    sim_raw = stage1_text @ stage1_gallery.t()
+    ranks_raw = stage1_ranks(sim_raw, enc["gt_pos"])
+    rep_raw = report_from_ranks(ranks_raw)
+    sim = sim_raw
     if use_sinkhorn:
         print(f"      applying {sinkhorn_mode} normalization "
               f"(epsilon={sinkhorn_epsilon}, iter={sinkhorn_max_iter})", flush=True)
-        sim = apply_sinkhorn_or_dbsn(sim, enc["gallery_feats"],
+        sim = apply_sinkhorn_or_dbsn(sim, stage1_gallery,
                                      query_bank_path=query_bank_path,
                                      mode=sinkhorn_mode,
                                      epsilon=sinkhorn_epsilon,
@@ -551,11 +595,11 @@ def run_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
           f"pairs={sim.size(0) * K:,} chunk={pair_chunk}", flush=True)
     itm = itm_rerank(model, enc["gallery_embeds"], enc["txt_embeds"], enc["txt_masks"],
                      topk_idx, device, pair_chunk, rerank_models=rerank_models)
-    final = itm + topk_sim                                                # BLIP: logit + cosine
+    final = itm_weight * itm + stage1_weight * topk_sim
     ranks2, order2 = ranks_after_rerank(sim, topk_idx, final, enc["gt_pos"], ranks1)
     rep2 = report_from_ranks(ranks2)
-    reports = {"stage1": rep1, "rerank": rep2}
-    ranks_out = {"stage1": ranks1, "rerank": ranks2}
+    reports = {"stage1_raw": rep_raw, "stage1": rep1, "rerank": rep2}
+    ranks_out = {"stage1_raw": ranks_raw, "stage1": ranks1, "rerank": ranks2}
 
     # (pairwise / duo) reorder the top-N of the ITM order via the comparator, RRF-fused
     order_pw, ranks_pw = order2, ranks2
@@ -583,7 +627,7 @@ def run_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
 
     if use_sca:
         print("[4/5] Greedy SCA ablation", flush=True)
-        order_sca, _ = greedy_sca(base_order, base_scores, query_feats=enc["txt_feats"])
+        order_sca, _ = greedy_sca(base_order, base_scores, query_feats=stage1_text)
         ranks_sca = ranks_after_order(order_sca, enc["gt_pos"], ranks1)
         reports["greedy_sca"] = report_from_ranks(ranks_sca)
         ranks_out["greedy_sca"] = ranks_sca
@@ -609,13 +653,23 @@ def run_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
         "gale_shapley": build_top10(order3, sim, enc["gallery_ids"]),
     }
     top10 = top10_by_stage["gale_shapley" if use_gale_shapley else "rerank"]
+    diagnostics = {
+        "stage1_gt_at_rank2": int((ranks1 == 2).sum()),
+        "rerank_gt_at_rank2": int((ranks2 == 2).sum()),
+        "greedy_sca_gt_at_rank2": int((ranks_sca == 2).sum()) if use_sca else int((ranks2 == 2).sum()),
+        "gale_shapley_gt_at_rank2": int((ranks3 == 2).sum()),
+        "rerank_top1_conflicts": top1_conflict_count(order2),
+        "greedy_sca_top1_conflicts": top1_conflict_count(order_sca),
+        "gale_shapley_top1_conflicts": top1_conflict_count(order3),
+    }
     return dict(**reports, ranks=ranks_out,
                 top10=top10, top10_by_stage=top10_by_stage,
+                diagnostics=diagnostics,
                 gallery_size=sim.size(1), num_queries=sim.size(0), topk=K)
 
 
 @torch.no_grad()
-def run_submit_pipeline(model, dataset, device, topk: int = 100, batch_size: int = 64,
+def run_submit_pipeline(model, dataset, device, topk: int = 200, batch_size: int = 64,
                         num_workers: int = 2, pair_chunk: int = 50,
                         postprocess: str = "gale_shapley",
                         use_sinkhorn: bool = False,
@@ -623,7 +677,8 @@ def run_submit_pipeline(model, dataset, device, topk: int = 100, batch_size: int
                         query_bank_path: str | None = None,
                         sinkhorn_epsilon: float = 0.05,
                         sinkhorn_max_iter: int = 20,
-                        rerank_models=None) -> dict:
+                        rerank_models=None, stage1_payload=None,
+                        stage1_weight: float = 1.0, itm_weight: float = 1.0) -> dict:
     """No-GT inference path for the official hidden/test set.
 
     Returns top-10 image ids without computing rank metrics. `postprocess` is one of:
@@ -636,11 +691,12 @@ def run_submit_pipeline(model, dataset, device, topk: int = 100, batch_size: int
     enc = encode_eval_set(model, dataset, device, batch_size, num_workers)
     print(f"      encoded gallery={len(enc['gallery_ids']):,} queries={enc['txt_feats'].size(0):,}", flush=True)
     print("[2/5] Computing ITC cosine + Top-K", flush=True)
-    sim = enc["txt_feats"] @ enc["gallery_feats"].t()
+    stage1_gallery, stage1_text = load_stage1_features(stage1_payload, enc)
+    sim = stage1_text @ stage1_gallery.t()
     if use_sinkhorn:
         print(f"      applying {sinkhorn_mode} normalization "
               f"(epsilon={sinkhorn_epsilon}, iter={sinkhorn_max_iter})", flush=True)
-        sim = apply_sinkhorn_or_dbsn(sim, enc["gallery_feats"],
+        sim = apply_sinkhorn_or_dbsn(sim, stage1_gallery,
                                      query_bank_path=query_bank_path,
                                      mode=sinkhorn_mode,
                                      epsilon=sinkhorn_epsilon,
@@ -652,13 +708,13 @@ def run_submit_pipeline(model, dataset, device, topk: int = 100, batch_size: int
           f"pairs={sim.size(0) * K:,} chunk={pair_chunk}", flush=True)
     itm = itm_rerank(model, enc["gallery_embeds"], enc["txt_embeds"], enc["txt_masks"],
                      topk_idx, device, pair_chunk, rerank_models=rerank_models)
-    final = itm + topk_sim
+    final = itm_weight * itm + stage1_weight * topk_sim
     order_in_k = final.argsort(dim=1, descending=True)
     order_rerank = torch.gather(topk_idx, 1, order_in_k)
     scores_rerank = torch.gather(final, 1, order_in_k)
 
     print("[4/5] Greedy SCA candidate", flush=True)
-    order_sca, _ = greedy_sca(order_rerank, scores_rerank, query_feats=enc["txt_feats"])
+    order_sca, _ = greedy_sca(order_rerank, scores_rerank, query_feats=stage1_text)
 
     print("[5/5] Gale-Shapley candidate", flush=True)
     matched = gale_shapley_match(order_rerank, scores_rerank)

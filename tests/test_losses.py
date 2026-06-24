@@ -1,7 +1,13 @@
 """Loss correctness + key invariants."""
 import torch
 
-from star.losses import ITCLoss, ITMLoss, SmoothAPLoss, build_itm_pairs
+from star.losses import (
+    ITCLoss,
+    ITMLoss,
+    SmoothAPLoss,
+    build_explicit_itm_pairs,
+    build_itm_pairs,
+)
 from star.losses.smooth_ap import smooth_ap_from_sim
 
 
@@ -90,3 +96,12 @@ def test_itm_loss_runs():
     logits = torch.randn(12, 2)
     labels = torch.randint(0, 2, (12,))
     assert torch.isfinite(ITMLoss()(logits, labels))
+
+
+def test_explicit_itm_pairs_use_the_declared_partner_in_both_directions():
+    partner = torch.tensor([1, 0, 3, 2])
+    pairs = build_explicit_itm_pairs(partner)
+    n = len(partner)
+    assert pairs["img_idx"].tolist() == [0, 1, 2, 3, 0, 1, 2, 3, 1, 0, 3, 2]
+    assert pairs["txt_idx"].tolist() == [0, 1, 2, 3, 1, 0, 3, 2, 0, 1, 2, 3]
+    assert pairs["label"].tolist() == [1] * n + [0] * (2 * n)

@@ -1,7 +1,7 @@
 """Run the STAR-v3 inference pipeline on an eval manifest.
 
     python scripts/run_inference.py --ckpt best.pth --manifest eval.parquet \
-        --image-root /data --base-ckpt xvlm_16m_base.th --out-dir infer_out --topk 100
+        --image-root /data --base-ckpt xvlm_16m_base.th --out-dir infer_out --topk 200
 
 Pipeline (per inference2.svg, trimmed): cosine Stage-1 -> Top-K -> cross-encoder ITM
 re-rank (BLIP-style logit+cosine) -> Gale-Shapley rank-1 assignment -> top-10/query.
@@ -37,7 +37,15 @@ def main():
     ap.add_argument("--base-ckpt", default=None, help="X-VLM base weights (model construction)")
     ap.add_argument("--config", default="configs/star_v3_10k_kaggle.yaml")
     ap.add_argument("--out-dir", default="infer_out")
-    ap.add_argument("--topk", type=int, default=100)
+    ap.add_argument("--topk", type=int, default=200)
+    ap.add_argument("--stage1-payload", default=None, help="PE features from extract_pe_features.py")
+    ap.add_argument("--stage1-weight", type=float, default=1.0)
+    ap.add_argument("--itm-weight", type=float, default=1.0)
+    ap.add_argument("--use-sinkhorn", action="store_true")
+    ap.add_argument("--sinkhorn-mode", choices=("sinkhorn", "dbsn"), default="dbsn")
+    ap.add_argument("--query-bank", default=None)
+    ap.add_argument("--sinkhorn-epsilon", type=float, default=0.05)
+    ap.add_argument("--sinkhorn-iters", type=int, default=20)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--num-workers", type=int, default=2)
     ap.add_argument("--no-gale-shapley", action="store_true")
@@ -67,22 +75,34 @@ def main():
 
     t0 = time.time()
     res = run_pipeline(model, ds, device, topk=args.topk, batch_size=args.batch_size,
-                       num_workers=args.num_workers, use_gale_shapley=not args.no_gale_shapley)
+                       num_workers=args.num_workers, use_gale_shapley=not args.no_gale_shapley,
+                       stage1_payload=args.stage1_payload,
+                       stage1_weight=args.stage1_weight, itm_weight=args.itm_weight,
+                       use_sinkhorn=args.use_sinkhorn, sinkhorn_mode=args.sinkhorn_mode,
+                       query_bank_path=args.query_bank,
+                       sinkhorn_epsilon=args.sinkhorn_epsilon,
+                       sinkhorn_max_iter=args.sinkhorn_iters)
     mins = (time.time() - t0) / 60
 
     log.info(f"gallery={res['gallery_size']} queries={res['num_queries']} K={res['topk']} ({mins:.1f} min)")
-    for stage in ("stage1", "rerank", "gale_shapley"):
+    for stage in ("stage1_raw", "stage1", "rerank", "gale_shapley"):
         log.info(f"[{stage:12s}] " + " ".join(f"{k}={v:.4f}" for k, v in res[stage].items()))
+    log.info(f"[diagnostics] {res['diagnostics']}")
 
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "metrics.json").write_text(json.dumps(
-        {s: res[s] for s in ("stage1", "rerank", "gale_shapley")} |
+        {s: res[s] for s in ("stage1_raw", "stage1", "rerank", "gale_shapley")} |
+        {"diagnostics": res["diagnostics"]} |
         {"gallery_size": res["gallery_size"], "num_queries": res["num_queries"],
          "topk": res["topk"], "minutes": round(mins, 1)}, indent=2), encoding="utf-8")
     with open(out / "answer.txt", "w", encoding="utf-8") as f:
         for qi, ids in enumerate(res["top10"]):
             f.write(" ".join([str(qi)] + [str(x) for x in ids]) + "\n")
+    for stage, rows in res["top10_by_stage"].items():
+        with (out / f"answer_{stage}.txt").open("w", encoding="utf-8") as handle:
+            for qi, ids in enumerate(rows):
+                handle.write(" ".join([str(qi)] + [str(x) for x in ids]) + "\n")
     torch.save(res["ranks"], out / "ranks.pt")
     log.info(f"wrote {out}/metrics.json, answer.txt, ranks.pt")
 

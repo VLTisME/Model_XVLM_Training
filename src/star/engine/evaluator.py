@@ -70,7 +70,7 @@ def evaluate_retrieval(model, dataset, device, batch_size: int = 64, num_workers
         is_query.extend(batch["is_query"])
     sim, gt_index = assemble_query_gallery(torch.cat(img_feats), torch.cat(txt_feats),
                                            image_ids, is_query)
-    return full_report(sim, gt_index)
+    return full_report(sim, gt_index, ks=(1, 5, 10, 50, 200))
 
 
 def _eval_collate(batch):

@@ -180,14 +180,32 @@ class XVLMBackbone(nn.Module):
 
         repo = Path(getattr(cfg.model, "xvlm_repo", "") or
                     (Path(__file__).resolve().parents[3] / "third_party" / "X-VLM"))
+        required_source = repo / "models" / "model_retrieval.py"
+        if not required_source.exists():
+            raise FileNotFoundError(
+                "X-VLM source code is missing. Expected:\n"
+                f"  {required_source}\n"
+                "Clone it with:\n"
+                f"  git clone --depth 1 https://github.com/zengyan-97/X-VLM.git {repo}\n"
+                "or pass an existing checkout with:\n"
+                "  --set model.xvlm_repo=/absolute/path/to/X-VLM"
+            )
         if str(repo) not in sys.path:
             sys.path.insert(0, str(repo))
 
         ckpt = Path(cfg.model.checkpoint)
         if not ckpt.is_absolute():
             ckpt = Path(__file__).resolve().parents[3] / ckpt
+        if not ckpt.exists():
+            raise FileNotFoundError(f"X-VLM checkpoint does not exist: {ckpt}")
 
-        from models.model_retrieval import XVLM  # noqa: E402  (X-VLM repo)
+        try:
+            from models.model_retrieval import XVLM  # noqa: E402  (X-VLM repo)
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                f"Could not import X-VLM from {repo}. "
+                "Verify that this directory contains models/model_retrieval.py."
+            ) from exc
         from transformers import BertTokenizer   # noqa: E402
 
         self._build_cfg = {
@@ -200,6 +218,19 @@ class XVLMBackbone(nn.Module):
         }
         self.model = XVLM(config=self._build_cfg)
         self.model.load_pretrained(str(ckpt), self._build_cfg, is_eval=False)
+        if cfg.train.grad_checkpointing:
+            vision_setter = getattr(self.model.vision_encoder, "set_grad_checkpointing", None)
+            if callable(vision_setter):
+                vision_setter(True)
+            text_setter = getattr(self.model.text_encoder, "gradient_checkpointing_enable", None)
+            if callable(text_setter):
+                try:
+                    text_setter()
+                except (ValueError, NotImplementedError):
+                    # X-VLM is pinned to transformers 4.12.5. Its BertModel exposes this
+                    # method through PreTrainedModel but declares checkpointing unsupported.
+                    # Keep Swin checkpointing enabled and let the old BERT run normally.
+                    pass
         self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
         self.temp = self.model.temp     # share the PRETRAINED temperature with ITCLoss (fix #6)
 

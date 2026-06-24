@@ -4,6 +4,7 @@ from .pipeline import (
     gale_shapley_match,
     apply_sinkhorn_or_dbsn,
     itm_rerank,
+    load_stage1_features,
     pairwise_features,
     pairwise_rerank,
     ranks_after_rerank,
@@ -18,6 +19,7 @@ from .pipeline import (
 __all__ = [
     "encode_eval_set",
     "itm_rerank",
+    "load_stage1_features",
     "stage1_ranks",
     "ranks_after_rerank",
     "gale_shapley_match",

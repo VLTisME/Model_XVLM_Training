@@ -1,4 +1,4 @@
-# Pinned deps to run the REAL X-VLM backbone (transformers 4.12.5 era) on Python 3.11.
+# Pinned deps to run the REAL X-VLM backbone (transformers 4.12.5 era) on Python 3.10.
 # Install into a SEPARATE venv (.venv-xvlm) — see README §5 for the full recipe.
 # NOTE: torch/torchvision and the two --no-deps packages are installed separately (README §5);
 #       transformers==4.12.5 and timm==0.4.9 go in with --no-deps so the unbuildable old

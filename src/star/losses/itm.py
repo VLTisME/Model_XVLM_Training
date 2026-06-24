@@ -62,6 +62,30 @@ def build_itm_pairs(
     return {"img_idx": img_idx, "txt_idx": txt_idx, "label": label}
 
 
+def build_explicit_itm_pairs(partner_index: Tensor) -> dict[str, Tensor]:
+    """Build 3N examples from one explicit in-batch hard partner per row."""
+    if partner_index.ndim != 1:
+        raise ValueError("partner_index must be a 1D tensor")
+    n = partner_index.numel()
+    device = partner_index.device
+    diag = torch.arange(n, device=device)
+    if n == 0 or (partner_index < 0).any() or (partner_index >= n).any():
+        raise ValueError("every row must have one valid in-batch partner")
+    if (partner_index == diag).any():
+        raise ValueError("a row cannot be its own hard partner")
+    return {
+        "img_idx": torch.cat([diag, diag, partner_index]),
+        "txt_idx": torch.cat([diag, partner_index, diag]),
+        "label": torch.cat(
+            [
+                torch.ones(n, device=device),
+                torch.zeros(n, device=device),
+                torch.zeros(n, device=device),
+            ]
+        ).long(),
+    }
+
+
 class ITMLoss(nn.Module):
     """2-way cross-entropy on cross-encoder match logits."""
 

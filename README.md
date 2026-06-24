@@ -7,6 +7,11 @@ trained with **`L = ITC + λ₁·ITM + λ₂·Smooth-AP`** (MLM removed), with *
 **all_gather** contrastive (XBM removed — review fix #4), optional **LHP** augmentation and a
 **pose branch** fused into the image side.
 
+The experimental `exp/star-v3-pe30k-combined` path adds a separate
+`PE-Core-bigG-14-448` retriever with XBM, bbox-aware pair-consistent augmentation, explicit
+full-pair ITM batches, and PE → DBSN → Top-200 → X-VLM inference. See
+[`../../pipeline/STAR_v3_PE_runbook.md`](../../pipeline/STAR_v3_PE_runbook.md).
+
 > Full math + code walkthrough: **[`analyze.md`](analyze.md)**.
 
 ---

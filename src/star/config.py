@@ -22,17 +22,28 @@ class DataConfig:
     lhp_enabled: bool = False
     lhp_min_scale: float = 0.5
     lhp_use_bbox: bool = True
+    pair_consistent_aug: bool = True
+    motion_blur_p: float = 0.25
+    jpeg_p: float = 0.35
+    downscale_p: float = 0.30
+    color_jitter_p: float = 0.30
+    noise_p: float = 0.15
+    erase_p: float = 0.20
+    max_aug_ops: int = 2
     # smart sampler
     group_by: str = "scene"          # "scene" | "action" | "none" | "pair" | "pair_mixed"
     group_fraction: float = 0.5       # fraction of batch drawn from one group
-    pair_hard_pairs: int = 4          # for group_by=pair_mixed: mined hard pairs per batch
+    pair_hard_pairs: int = -1         # -1 = batch_size//2, every row has one hard partner
     num_workers: int = 8
+    prefetch_factor: int = 4
+    persistent_workers: bool = True
 
 
 @dataclass
 class ModelConfig:
     backbone: str = "xvlm"            # "xvlm" | "dummy"
     checkpoint: str | None = None     # path to X-VLM / CMP weights
+    xvlm_repo: str | None = None      # external zengyan-97/X-VLM source checkout
     embed_dim: int = 256
     # LoRA
     lora_enabled: bool = True
@@ -84,6 +95,11 @@ class TrainConfig:
     seed: int = 42
     out_dir: str = "outputs/star_v3"
     log_wandb: bool = False
+    log_every_steps: int = 25
+    log_jsonl: bool = True
+    log_tensorboard: bool = True
+    log_nvml: bool = True
+    best_r10_max_drop: float = 0.002
 
 
 @dataclass
