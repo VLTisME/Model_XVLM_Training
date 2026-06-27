@@ -640,6 +640,41 @@ def report_from_ranks(ranks: Tensor, ks=(1, 5, 10, 50, 200)) -> dict[str, float]
     return rep
 
 
+def score_calibration_report(itm: Tensor, stage1: Tensor, final: Tensor,
+                             stage1_weight: float) -> dict[str, float | int]:
+    """Describe whether the normalized Stage-1 prior materially changes ITM rankings."""
+    def stats(prefix: str, values: Tensor) -> dict[str, float]:
+        values = values.float()
+        return {
+            f"{prefix}_min": float(values.min()),
+            f"{prefix}_max": float(values.max()),
+            f"{prefix}_mean": float(values.mean()),
+            f"{prefix}_std": float(values.std()),
+        }
+
+    def median_top2_gap(values: Tensor) -> float:
+        if values.size(1) < 2:
+            return 0.0
+        top2 = values.float().topk(2, dim=1).values
+        return float((top2[:, 0] - top2[:, 1]).median())
+
+    weighted = float(stage1_weight) * stage1.float()
+    report = {
+        **stats("itm", itm),
+        **stats("stage1", stage1),
+        **stats("weighted_stage1", weighted),
+        "stage1_weight": float(stage1_weight),
+        "itm_median_top2_gap": median_top2_gap(itm),
+        "stage1_median_top2_gap": median_top2_gap(stage1),
+        "final_median_top2_gap": median_top2_gap(final),
+        "top1_changed_by_stage1": int(
+            (itm.argmax(dim=1) != final.argmax(dim=1)).sum()
+        ),
+        "query_count": int(itm.size(0)),
+    }
+    return report
+
+
 # --------------------------------------------------------------------------- orchestrator
 @torch.no_grad()
 def run_pipeline(model, dataset, device, topk: int = 200, batch_size: int = 64,
@@ -712,6 +747,7 @@ def run_pipeline(model, dataset, device, topk: int = 200, batch_size: int = 64,
     itm = itm_rerank(model, enc["gallery_embeds"], enc["txt_embeds"], enc["txt_masks"],
                      topk_idx, device, pair_chunk, rerank_models=rerank_models)
     final = itm_weight * itm + stage1_weight * topk_sim
+    score_calibration = score_calibration_report(itm, topk_sim, final, stage1_weight)
     ranks2, order2 = ranks_after_rerank(sim, topk_idx, final, enc["gt_pos"], ranks1)
     rep2 = report_from_ranks(ranks2)
     reports = {
@@ -787,6 +823,7 @@ def run_pipeline(model, dataset, device, topk: int = 200, batch_size: int = 64,
         "rerank_top1_conflicts": top1_conflict_count(order2),
         "greedy_sca_top1_conflicts": top1_conflict_count(order_sca),
         "gale_shapley_top1_conflicts": top1_conflict_count(order3),
+        "score_calibration": score_calibration,
     }
     return dict(**reports, ranks=ranks_out,
                 top10=top10, top10_by_stage=top10_by_stage,
@@ -851,6 +888,7 @@ def run_submit_pipeline(model, dataset, device, topk: int = 200, batch_size: int
     itm = itm_rerank(model, enc["gallery_embeds"], enc["txt_embeds"], enc["txt_masks"],
                      topk_idx, device, pair_chunk, rerank_models=rerank_models)
     final = itm_weight * itm + stage1_weight * topk_sim
+    score_calibration = score_calibration_report(itm, topk_sim, final, stage1_weight)
     order_in_k = final.argsort(dim=1, descending=True)
     order_rerank = torch.gather(topk_idx, 1, order_in_k)
     scores_rerank = torch.gather(final, 1, order_in_k)
@@ -876,4 +914,5 @@ def run_submit_pipeline(model, dataset, device, topk: int = 200, batch_size: int
         "gallery_size": len(enc["gallery_ids"]),
         "num_queries": topk_idx.size(0),
         "topk": K,
+        "diagnostics": {"score_calibration": score_calibration},
     }

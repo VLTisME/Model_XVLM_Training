@@ -73,6 +73,9 @@ def parse_args():
     fuse.add_argument("--dfn", required=True)
     fuse.add_argument("--output", required=True)
     fuse.add_argument("--rrf-constant", type=int, default=60)
+    fuse.add_argument("--pe-weight", type=float, default=1.0)
+    fuse.add_argument("--siglip2-weight", type=float, default=1.0)
+    fuse.add_argument("--dfn-weight", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -321,6 +324,13 @@ def feature_scores(features: dict, candidates: dict) -> torch.Tensor:
 
 
 def run_fuse(args):
+    weights = {
+        "pe": float(args.pe_weight),
+        "siglip2": float(args.siglip2_weight),
+        "dfn": float(args.dfn_weight),
+    }
+    if any(value < 0 for value in weights.values()) or not any(weights.values()):
+        raise ValueError("RRF model weights must be non-negative and not all zero")
     candidates = load_payload(args.candidates)
     siglip = load_payload(args.siglip2)
     dfn = load_payload(args.dfn)
@@ -333,9 +343,9 @@ def run_fuse(args):
     dfn_ranks = rank_positions(dfn_scores)
     constant = float(args.rrf_constant)
     rrf = (
-        1.0 / (constant + pe_ranks.float())
-        + 1.0 / (constant + sig_ranks.float())
-        + 1.0 / (constant + dfn_ranks.float())
+        weights["pe"] / (constant + pe_ranks.float())
+        + weights["siglip2"] / (constant + sig_ranks.float())
+        + weights["dfn"] / (constant + dfn_ranks.float())
     )
     order = rrf.argsort(dim=1, descending=True)
     candidate_rows = candidates["candidate_image_ids"]
@@ -364,7 +374,7 @@ def run_fuse(args):
         "metadata": {
             **candidates.get("metadata", {}),
             "rrf_constant": args.rrf_constant,
-            "rrf_weights": {"pe": 1.0, "siglip2": 1.0, "dfn": 1.0},
+            "rrf_weights": weights,
             "siglip2_model_id": siglip.get("model_id"),
             "dfn_model_id": dfn.get("model_id"),
         },
