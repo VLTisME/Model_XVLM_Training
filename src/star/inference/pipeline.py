@@ -4,7 +4,9 @@
         -> (2) Top-K filter -> (3) cross-encoder ITM re-rank
         -> optional SCA / Gale-Shapley rank-1 postprocess -> top-10 / query
 
-Dropped per decision: (4) ensemble, GNN/k-reciprocal. Sinkhorn/DBSN is optional.
+The default path remains single-retriever. An optional external candidate payload lets a
+PE-local ensemble provide its ranked Top-K block without changing ITM or postprocessing.
+GNN/k-reciprocal are not included. Sinkhorn/DBSN is optional during candidate generation.
 Metrics are reported at every old-test stage (cosine / +rerank / +SCA / +GS) so each
 block's contribution is measured, not assumed. Official submit mode skips GT metrics.
 
@@ -140,6 +142,86 @@ def load_stage1_features(payload, enc: dict) -> tuple[Tensor, Tensor]:
     gallery = payload["gallery_feats"][gallery_order].float()
     text = payload["txt_feats"][query_order].float()
     return gallery, text
+
+
+def _payload_query_order(payload_ids: list, encoded_ids: list) -> list[int]:
+    """Align payload queries by GT image ID while preserving duplicate occurrences."""
+    positions: dict[str, list[int]] = {}
+    for index, value in enumerate(payload_ids):
+        positions.setdefault(str(value), []).append(index)
+    cursor = {key: 0 for key in positions}
+    order = []
+    try:
+        for value in encoded_ids:
+            key = str(value)
+            offset = cursor[key]
+            order.append(positions[key][offset])
+            cursor[key] += 1
+    except (KeyError, IndexError) as exc:
+        raise ValueError(
+            "Candidate payload does not match the X-VLM manifest query order/IDs"
+        ) from exc
+    return order
+
+
+def load_candidate_payload(payload, enc: dict) -> dict | None:
+    """Load an externally ranked Top-K block and align it to the encoded eval set.
+
+    The payload stores image IDs rather than relying on either model's gallery order. This
+    keeps PE/OpenCLIP candidate generation independent from X-VLM manifest ordering.
+    """
+    if payload is None:
+        return None
+    if isinstance(payload, (str, bytes, Path)):
+        try:
+            payload = torch.load(payload, map_location="cpu", weights_only=False)
+        except TypeError:
+            payload = torch.load(payload, map_location="cpu")
+
+    required = {"query_image_ids", "candidate_image_ids", "candidate_scores"}
+    missing = required.difference(payload)
+    if missing:
+        raise KeyError(f"Candidate payload is missing fields: {sorted(missing)}")
+
+    query_order = _payload_query_order(payload["query_image_ids"], enc["query_image_ids"])
+    gallery_pos = {str(value): index for index, value in enumerate(enc["gallery_ids"])}
+    candidate_rows = [payload["candidate_image_ids"][index] for index in query_order]
+    if not candidate_rows or not candidate_rows[0]:
+        raise ValueError("Candidate payload contains no candidates")
+    width = len(candidate_rows[0])
+    if any(len(row) != width for row in candidate_rows):
+        raise ValueError("Candidate payload rows have inconsistent lengths")
+    if any(len({str(value) for value in row}) != width for row in candidate_rows):
+        raise ValueError("Candidate payload contains duplicate image IDs within a query")
+    try:
+        indices = torch.tensor(
+            [[gallery_pos[str(value)] for value in row] for row in candidate_rows],
+            dtype=torch.long,
+        )
+    except KeyError as exc:
+        raise ValueError(f"Candidate image is missing from the X-VLM gallery: {exc}") from exc
+
+    scores = torch.as_tensor(payload["candidate_scores"])[query_order].float()
+    if scores.shape != indices.shape:
+        raise ValueError(
+            f"Candidate score shape {tuple(scores.shape)} does not match "
+            f"candidate indices {tuple(indices.shape)}"
+        )
+    if not torch.isfinite(scores).all():
+        raise ValueError("Candidate payload contains non-finite scores")
+
+    result = {
+        "indices": indices,
+        "scores": scores,
+        "metadata": payload.get("metadata", {}),
+    }
+    for key in ("pe_raw_ranks", "pe_selected_ranks", "stage1_ranks"):
+        if key in payload and payload[key] is not None:
+            ranks = torch.as_tensor(payload[key])[query_order].long()
+            if ranks.numel() != indices.size(0):
+                raise ValueError(f"{key} length does not match the query count")
+            result[key] = ranks
+    return result
 
 
 # --------------------------------------------------------------------------- stage 1
@@ -297,7 +379,7 @@ def itm_rerank(model, gallery_embeds: Tensor, txt_embeds: Tensor, txt_masks: Ten
     return out
 
 
-def ranks_after_rerank(sim: Tensor, topk_idx: Tensor, final_scores: Tensor,
+def ranks_after_rerank(sim: Tensor | None, topk_idx: Tensor, final_scores: Tensor,
                        gt_pos: Tensor, ranks_s1: Tensor) -> tuple[Tensor, Tensor]:
     """Exact GT ranks after reordering the K-block by final_scores (desc).
 
@@ -306,7 +388,7 @@ def ranks_after_rerank(sim: Tensor, topk_idx: Tensor, final_scores: Tensor,
     order_in_k = final_scores.argsort(dim=1, descending=True)            # [Q, K]
     new_order = torch.gather(topk_idx, 1, order_in_k)                    # gallery idx, reranked
     ranks = ranks_s1.clone()
-    for qi in range(sim.size(0)):
+    for qi in range(topk_idx.size(0)):
         hit = (new_order[qi] == gt_pos[qi]).nonzero(as_tuple=True)[0]
         if len(hit):
             ranks[qi] = int(hit[0]) + 1          # GT inside K-block -> new position
@@ -334,14 +416,19 @@ def ranks_after_order(order: Tensor, gt_pos: Tensor, ranks_fallback: Tensor) -> 
     return ranks
 
 
-def build_top10(order: Tensor, sim: Tensor, gallery_ids: list[str]) -> list[list[str]]:
+def build_top10(order: Tensor, sim: Tensor | None, gallery_ids: list[str]) -> list[list[str]]:
     """Top-10 = chosen K-block order followed by the original ITC tail."""
-    s1_order = sim.argsort(dim=1, descending=True)
+    if sim is None and order.size(1) < 10:
+        raise ValueError("Candidate-only Top-10 requires at least 10 candidates per query")
+    s1_order = sim.argsort(dim=1, descending=True) if sim is not None else None
     top10 = []
     for q in range(order.size(0)):
         seen = order[q].tolist()
         seen_set = set(seen)
-        tail = [int(g) for g in s1_order[q] if int(g) not in seen_set]
+        tail = (
+            [int(g) for g in s1_order[q] if int(g) not in seen_set]
+            if s1_order is not None else []
+        )
         full = (seen + tail)[:10]
         top10.append([gallery_ids[g] for g in full])
     return top10
@@ -562,44 +649,83 @@ def run_pipeline(model, dataset, device, topk: int = 200, batch_size: int = 64,
                  sinkhorn_mode: str = "sinkhorn", query_bank_path: str | None = None,
                  sinkhorn_epsilon: float = 0.05, sinkhorn_max_iter: int = 20,
                  rerank_models=None, stage1_payload=None,
+                 candidate_payload=None,
                  stage1_weight: float = 1.0, itm_weight: float = 1.0) -> dict:
     """Full inference. Returns stage-wise reports + final top-10 per query.
 
+    `candidate_payload` may provide an ID-aligned, externally ranked Top-K block. Its scores
+    are blended with ITM using `stage1_weight`; DBSN must already have been applied upstream.
     If `pairwise_head` (a trained PairwiseHead) is given, a 'pairwise' stage reorders the top-N of
     the ITM order by a round-robin tournament and RRF-fuses it back — measured independently.
     """
     print(f"[1/5] Encoding eval set | rows={len(dataset):,} batch={batch_size}", flush=True)
     enc = encode_eval_set(model, dataset, device, batch_size, num_workers)
     print(f"      encoded gallery={len(enc['gallery_ids']):,} queries={enc['txt_feats'].size(0):,}", flush=True)
-    print("[2/5] Computing ITC cosine + Top-K", flush=True)
+    print("[2/5] Computing or loading Stage-1 candidates", flush=True)
     stage1_gallery, stage1_text = load_stage1_features(stage1_payload, enc)
-    sim_raw = stage1_text @ stage1_gallery.t()
-    ranks_raw = stage1_ranks(sim_raw, enc["gt_pos"])
+    candidates = load_candidate_payload(candidate_payload, enc)
+    if candidates is None:
+        sim_raw = stage1_text @ stage1_gallery.t()
+        ranks_raw = stage1_ranks(sim_raw, enc["gt_pos"])
+        sim = sim_raw
+        if use_sinkhorn:
+            print(f"      applying {sinkhorn_mode} normalization "
+                  f"(epsilon={sinkhorn_epsilon}, iter={sinkhorn_max_iter})", flush=True)
+            sim = apply_sinkhorn_or_dbsn(sim, stage1_gallery,
+                                         query_bank_path=query_bank_path,
+                                         mode=sinkhorn_mode,
+                                         epsilon=sinkhorn_epsilon,
+                                         max_iter=sinkhorn_max_iter)
+        ranks1 = stage1_ranks(sim, enc["gt_pos"])
+        K = min(topk, sim.size(1))
+        topk_sim, topk_idx = sim.topk(K, dim=1)
+    else:
+        if use_sinkhorn:
+            raise ValueError(
+                "candidate_payload is already ranked; apply PE DBSN during candidate "
+                "generation and pass use_sinkhorn=False to the X-VLM pipeline"
+            )
+        sim = None
+        topk_idx = candidates["indices"]
+        topk_sim = candidates["scores"]
+        K = topk_idx.size(1)
+        if topk != K:
+            print(f"      candidate payload fixes K={K}; ignoring requested topk={topk}",
+                  flush=True)
+        fallback = torch.full((topk_idx.size(0),), len(enc["gallery_ids"]), dtype=torch.long)
+        ranks_raw = candidates.get("pe_raw_ranks", fallback)
+        ranks_pe_selected = candidates.get("pe_selected_ranks", ranks_raw)
+        ranks1 = candidates.get("stage1_ranks", ranks_after_order(
+            topk_idx, enc["gt_pos"], fallback
+        ))
+        metadata = candidates.get("metadata", {})
+        print(f"      loaded candidate payload | mode={metadata.get('mode', 'unknown')} "
+              f"Q={topk_idx.size(0):,} K={K}", flush=True)
+
+    if candidates is None:
+        ranks_pe_selected = ranks1
     rep_raw = report_from_ranks(ranks_raw)
-    sim = sim_raw
-    if use_sinkhorn:
-        print(f"      applying {sinkhorn_mode} normalization "
-              f"(epsilon={sinkhorn_epsilon}, iter={sinkhorn_max_iter})", flush=True)
-        sim = apply_sinkhorn_or_dbsn(sim, stage1_gallery,
-                                     query_bank_path=query_bank_path,
-                                     mode=sinkhorn_mode,
-                                     epsilon=sinkhorn_epsilon,
-                                     max_iter=sinkhorn_max_iter)
-    K = min(topk, sim.size(1))
-
-    ranks1 = stage1_ranks(sim, enc["gt_pos"])
+    rep_pe_selected = report_from_ranks(ranks_pe_selected)
     rep1 = report_from_ranks(ranks1)
-
-    topk_sim, topk_idx = sim.topk(K, dim=1)
-    print(f"[3/5] Cross-encoder ITM rerank | queries={sim.size(0):,} K={K} "
-          f"pairs={sim.size(0) * K:,} chunk={pair_chunk}", flush=True)
+    print(f"[3/5] Cross-encoder ITM rerank | queries={topk_idx.size(0):,} K={K} "
+          f"pairs={topk_idx.size(0) * K:,} chunk={pair_chunk}", flush=True)
     itm = itm_rerank(model, enc["gallery_embeds"], enc["txt_embeds"], enc["txt_masks"],
                      topk_idx, device, pair_chunk, rerank_models=rerank_models)
     final = itm_weight * itm + stage1_weight * topk_sim
     ranks2, order2 = ranks_after_rerank(sim, topk_idx, final, enc["gt_pos"], ranks1)
     rep2 = report_from_ranks(ranks2)
-    reports = {"stage1_raw": rep_raw, "stage1": rep1, "rerank": rep2}
-    ranks_out = {"stage1_raw": ranks_raw, "stage1": ranks1, "rerank": ranks2}
+    reports = {
+        "stage1_raw": rep_raw,
+        "pe_selected": rep_pe_selected,
+        "stage1": rep1,
+        "rerank": rep2,
+    }
+    ranks_out = {
+        "stage1_raw": ranks_raw,
+        "pe_selected": ranks_pe_selected,
+        "stage1": ranks1,
+        "rerank": ranks2,
+    }
 
     # (pairwise / duo) reorder the top-N of the ITM order via the comparator, RRF-fused
     order_pw, ranks_pw = order2, ranks2
@@ -665,7 +791,7 @@ def run_pipeline(model, dataset, device, topk: int = 200, batch_size: int = 64,
     return dict(**reports, ranks=ranks_out,
                 top10=top10, top10_by_stage=top10_by_stage,
                 diagnostics=diagnostics,
-                gallery_size=sim.size(1), num_queries=sim.size(0), topk=K)
+                gallery_size=len(enc["gallery_ids"]), num_queries=topk_idx.size(0), topk=K)
 
 
 @torch.no_grad()
@@ -678,6 +804,7 @@ def run_submit_pipeline(model, dataset, device, topk: int = 200, batch_size: int
                         sinkhorn_epsilon: float = 0.05,
                         sinkhorn_max_iter: int = 20,
                         rerank_models=None, stage1_payload=None,
+                        candidate_payload=None,
                         stage1_weight: float = 1.0, itm_weight: float = 1.0) -> dict:
     """No-GT inference path for the official hidden/test set.
 
@@ -690,22 +817,37 @@ def run_submit_pipeline(model, dataset, device, topk: int = 200, batch_size: int
     print(f"[1/5] Encoding submit set | rows={len(dataset):,} batch={batch_size}", flush=True)
     enc = encode_eval_set(model, dataset, device, batch_size, num_workers)
     print(f"      encoded gallery={len(enc['gallery_ids']):,} queries={enc['txt_feats'].size(0):,}", flush=True)
-    print("[2/5] Computing ITC cosine + Top-K", flush=True)
+    print("[2/5] Computing or loading Stage-1 candidates", flush=True)
     stage1_gallery, stage1_text = load_stage1_features(stage1_payload, enc)
-    sim = stage1_text @ stage1_gallery.t()
-    if use_sinkhorn:
-        print(f"      applying {sinkhorn_mode} normalization "
-              f"(epsilon={sinkhorn_epsilon}, iter={sinkhorn_max_iter})", flush=True)
-        sim = apply_sinkhorn_or_dbsn(sim, stage1_gallery,
-                                     query_bank_path=query_bank_path,
-                                     mode=sinkhorn_mode,
-                                     epsilon=sinkhorn_epsilon,
-                                     max_iter=sinkhorn_max_iter)
-    K = min(topk, sim.size(1))
-    topk_sim, topk_idx = sim.topk(K, dim=1)
+    candidates = load_candidate_payload(candidate_payload, enc)
+    if candidates is None:
+        sim = stage1_text @ stage1_gallery.t()
+        if use_sinkhorn:
+            print(f"      applying {sinkhorn_mode} normalization "
+                  f"(epsilon={sinkhorn_epsilon}, iter={sinkhorn_max_iter})", flush=True)
+            sim = apply_sinkhorn_or_dbsn(sim, stage1_gallery,
+                                         query_bank_path=query_bank_path,
+                                         mode=sinkhorn_mode,
+                                         epsilon=sinkhorn_epsilon,
+                                         max_iter=sinkhorn_max_iter)
+        K = min(topk, sim.size(1))
+        topk_sim, topk_idx = sim.topk(K, dim=1)
+    else:
+        if use_sinkhorn:
+            raise ValueError(
+                "candidate_payload is already ranked; apply PE DBSN during candidate "
+                "generation and pass use_sinkhorn=False to the X-VLM pipeline"
+            )
+        sim = None
+        topk_idx = candidates["indices"]
+        topk_sim = candidates["scores"]
+        K = topk_idx.size(1)
+        metadata = candidates.get("metadata", {})
+        print(f"      loaded candidate payload | mode={metadata.get('mode', 'unknown')} "
+              f"Q={topk_idx.size(0):,} K={K}", flush=True)
 
-    print(f"[3/5] Cross-encoder ITM rerank | queries={sim.size(0):,} K={K} "
-          f"pairs={sim.size(0) * K:,} chunk={pair_chunk}", flush=True)
+    print(f"[3/5] Cross-encoder ITM rerank | queries={topk_idx.size(0):,} K={K} "
+          f"pairs={topk_idx.size(0) * K:,} chunk={pair_chunk}", flush=True)
     itm = itm_rerank(model, enc["gallery_embeds"], enc["txt_embeds"], enc["txt_masks"],
                      topk_idx, device, pair_chunk, rerank_models=rerank_models)
     final = itm_weight * itm + stage1_weight * topk_sim
@@ -731,7 +873,7 @@ def run_submit_pipeline(model, dataset, device, topk: int = 200, batch_size: int
         "top10": top10_by_stage[postprocess],
         "top10_by_stage": top10_by_stage,
         "postprocess": postprocess,
-        "gallery_size": sim.size(1),
-        "num_queries": sim.size(0),
+        "gallery_size": len(enc["gallery_ids"]),
+        "num_queries": topk_idx.size(0),
         "topk": K,
     }

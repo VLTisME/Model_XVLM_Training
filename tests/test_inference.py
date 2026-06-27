@@ -98,6 +98,62 @@ def test_full_pipeline_smoke_with_dummy_model(tmp_path):
         assert len(set(t)) == len(t)
 
 
+def test_pipeline_accepts_precomputed_candidate_payload(tmp_path):
+    """An external RRF block aligns by IDs and bypasses Stage-1 Top-K generation."""
+    import numpy as np
+    import pandas as pd
+    from PIL import Image
+    from star.config import Config
+    from star.data import PABDataset
+    from star.inference import run_pipeline
+    from star.models import STARModel
+
+    rng = np.random.default_rng(11)
+    rows = []
+    for i in range(12):
+        Image.fromarray((rng.random((64, 64, 3)) * 255).astype("uint8")).save(
+            tmp_path / f"g{i}.jpg"
+        )
+        rows.append(dict(
+            image_path=f"g{i}.jpg", caption=f"query {i}" if i < 4 else "",
+            split="valb", sequence_id=f"s{i}", scene=f"s{i}", action="x",
+            image_id=f"img{i}", bbox=None, keypoints=None,
+        ))
+    manifest = tmp_path / "candidate.parquet"
+    pd.DataFrame(rows).to_parquet(manifest, index=False)
+
+    cfg = Config()
+    cfg.model.backbone = "dummy"
+    cfg.model.embed_dim = 32
+    model = STARModel(cfg)
+    ds = PABDataset(
+        str(manifest), str(tmp_path), model.backbone.tokenizer, split="valb", train=False
+    )
+    candidate_ids = [
+        [f"img{q}", "img4", "img5", "img6", "img7", "img8", "img9", "img10", "img11", f"img{(q + 1) % 4}"]
+        for q in range(4)
+    ]
+    payload = {
+        "query_image_ids": [f"img{i}" for i in range(4)],
+        "candidate_image_ids": candidate_ids,
+        "candidate_scores": torch.linspace(1.0, 0.0, 10).repeat(4, 1),
+        "pe_raw_ranks": torch.ones(4, dtype=torch.long),
+        "pe_selected_ranks": torch.ones(4, dtype=torch.long),
+        "stage1_ranks": torch.ones(4, dtype=torch.long),
+        "metadata": {"mode": "raw"},
+    }
+    res = run_pipeline(
+        model, ds, "cpu", topk=10, batch_size=4, num_workers=0,
+        candidate_payload=payload, stage1_weight=0.25,
+    )
+
+    assert res["topk"] == 10
+    assert res["num_queries"] == 4 and res["gallery_size"] == 12
+    assert res["stage1_raw"]["R@1"] == 1.0
+    assert res["pe_selected"]["R@1"] == 1.0
+    assert all(len(row) == 10 for row in res["top10"])
+
+
 def _make_dummy_eval(tmp_path, captions, seed=0):
     """Write a tiny eval manifest + jpgs; `captions[i]` ("" => distractor) drives is_query."""
     import numpy as np
