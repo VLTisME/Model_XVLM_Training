@@ -22,6 +22,8 @@ Rank bookkeeping (exact, no approximation):
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -673,6 +675,397 @@ def score_calibration_report(itm: Tensor, stage1: Tensor, final: Tensor,
         "query_count": int(itm.size(0)),
     }
     return report
+
+
+# --------------------------------------------------------------------------- cached rerank
+RERANK_CACHE_VERSION = 2
+
+
+def _stable_hash(value) -> str:
+    raw = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                     separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _load_torch_payload(payload):
+    if isinstance(payload, (str, bytes, Path)):
+        try:
+            return torch.load(payload, map_location="cpu", weights_only=False)
+        except TypeError:
+            return torch.load(payload, map_location="cpu")
+    return payload
+
+
+def _cache_expected_metadata(candidate_payload, topk: int,
+                             cache_fingerprint: dict | None = None) -> dict:
+    payload = _load_torch_payload(candidate_payload)
+    rows = payload.get("candidate_image_ids")
+    if not rows:
+        raise ValueError("A non-empty candidate payload is required for cached reranking")
+    width = len(rows[0])
+    if width != int(topk) or any(len(row) != width for row in rows):
+        raise ValueError(f"Candidate payload width {width} does not match topk={topk}")
+    candidate_digest = payload.get("candidate_hash") or _stable_hash(rows)
+    return {
+        "cache_version": RERANK_CACHE_VERSION,
+        "candidate_hash": str(candidate_digest),
+        "query_hash": _stable_hash([str(value) for value in payload["query_image_ids"]]),
+        "topk": int(topk),
+        "fingerprint": dict(cache_fingerprint or {}),
+    }
+
+
+def load_valid_rerank_cache(path: str | Path, candidate_payload, topk: int,
+                            cache_fingerprint: dict | None = None) -> dict | None:
+    """Load a reusable CPU rerank cache, returning None when its inputs changed."""
+    path = Path(path)
+    if not path.is_file():
+        return None
+    cache = _load_torch_payload(path)
+    expected = _cache_expected_metadata(candidate_payload, topk, cache_fingerprint)
+    actual = cache.get("metadata", {})
+    mismatches = {
+        key: {"expected": value, "actual": actual.get(key)}
+        for key, value in expected.items() if actual.get(key) != value
+    }
+    if mismatches:
+        print(f"rerank cache invalid: {path}", flush=True)
+        for key, values in mismatches.items():
+            print(f"  {key}: expected={values['expected']!r} "
+                  f"actual={values['actual']!r}", flush=True)
+        return None
+    required = {
+        "gallery_ids", "query_image_ids", "query_labels", "candidate_image_ids", "candidate_indices",
+        "pe_scores", "itm_logits", "query_feats",
+    }
+    missing = required.difference(cache)
+    if missing:
+        print(f"rerank cache missing fields: {sorted(missing)}", flush=True)
+        return None
+    if actual.get("has_ground_truth"):
+        gt_missing = {"gt_pos", "pe_raw_ranks", "fallback_ranks"}.difference(cache)
+        if gt_missing:
+            print(f"rerank cache missing GT fields: {sorted(gt_missing)}", flush=True)
+            return None
+    expected_shape = (len(cache["query_image_ids"]), int(topk))
+    for key in ("candidate_indices", "pe_scores", "itm_logits"):
+        value = torch.as_tensor(cache[key])
+        if tuple(value.shape) != expected_shape:
+            print(f"rerank cache {key} shape {tuple(value.shape)} != "
+                  f"{expected_shape}", flush=True)
+            return None
+        if key != "candidate_indices" and not torch.isfinite(value).all():
+            print(f"rerank cache {key} contains non-finite values", flush=True)
+            return None
+    if any(len(row) != int(topk) for row in cache["candidate_image_ids"]):
+        print("rerank cache candidate rows have inconsistent width", flush=True)
+        return None
+    return cache
+
+
+@torch.no_grad()
+def prepare_rerank_cache(model, dataset, device, candidate_payload,
+                         cache_path: str | Path, topk: int = 50,
+                         batch_size: int = 64, num_workers: int = 2,
+                         pair_chunk: int = 50, rerank_models=None,
+                         stage1_payload=None, has_ground_truth: bool = True,
+                         query_labels: list[str] | None = None,
+                         cache_fingerprint: dict | None = None,
+                         overwrite: bool = False) -> tuple[dict, bool]:
+    """Run X-VLM once and persist the canonical candidate ITM logits.
+
+    The candidate payload order is canonical. Retrieval variants may assign new scores to
+    these candidates but must not change their IDs. Returns ``(cache, reused)``.
+    ``model`` and ``dataset`` may be None when a valid cache already exists.
+    """
+    cache_path = Path(cache_path)
+    if not overwrite:
+        cached = load_valid_rerank_cache(
+            cache_path, candidate_payload, topk, cache_fingerprint
+        )
+        if cached is not None:
+            print(f"reusing rerank cache: {cache_path}", flush=True)
+            return cached, True
+    if model is None or dataset is None:
+        raise ValueError("model and dataset are required to build an invalid or missing cache")
+
+    preparation_started = time.perf_counter()
+    if torch.cuda.is_available():
+        for device_index in range(torch.cuda.device_count()):
+            torch.cuda.reset_peak_memory_stats(device_index)
+    print(f"[cache 1/3] Encoding eval set | rows={len(dataset):,} "
+          f"batch={batch_size}", flush=True)
+    enc = encode_eval_set(model, dataset, device, batch_size, num_workers)
+    stage1_gallery, stage1_text = load_stage1_features(stage1_payload, enc)
+    candidates = load_candidate_payload(candidate_payload, enc)
+    if candidates is None:
+        raise ValueError("candidate_payload is required for cached reranking")
+    topk_idx = candidates["indices"]
+    if topk_idx.size(1) != int(topk):
+        raise ValueError(f"Aligned candidate width {topk_idx.size(1)} != topk={topk}")
+
+    print(f"[cache 2/3] Cross-encoder ITM | queries={topk_idx.size(0):,} "
+          f"K={topk_idx.size(1)} pairs={topk_idx.numel():,}", flush=True)
+    itm = itm_rerank(
+        model, enc["gallery_embeds"], enc["txt_embeds"], enc["txt_masks"],
+        topk_idx, device, pair_chunk, rerank_models=rerank_models,
+    )
+    payload = _load_torch_payload(candidate_payload)
+    query_order = _payload_query_order(payload["query_image_ids"], enc["query_image_ids"])
+    candidate_rows = [
+        [str(value) for value in payload["candidate_image_ids"][index]]
+        for index in query_order
+    ]
+    metadata = _cache_expected_metadata(candidate_payload, topk, cache_fingerprint)
+    metadata.update({
+        "gallery_size": len(enc["gallery_ids"]),
+        "num_queries": topk_idx.size(0),
+        "has_ground_truth": bool(has_ground_truth),
+        "created_at_unix": int(time.time()),
+        "preparation_seconds": round(time.perf_counter() - preparation_started, 4),
+        "peak_vram_mib": {
+            f"cuda:{device_index}": round(
+                torch.cuda.max_memory_allocated(device_index) / (1024 ** 2), 2
+            )
+            for device_index in range(torch.cuda.device_count())
+        } if torch.cuda.is_available() else {},
+    })
+    cache = {
+        "metadata": metadata,
+        "gallery_ids": [str(value) for value in enc["gallery_ids"]],
+        "query_image_ids": [str(value) for value in enc["query_image_ids"]],
+        "query_labels": [str(value) for value in (
+            query_labels if query_labels is not None else enc["query_image_ids"]
+        )],
+        "candidate_image_ids": candidate_rows,
+        "candidate_indices": topk_idx.cpu().long(),
+        "pe_scores": candidates["scores"].cpu().float(),
+        "itm_logits": itm.cpu().float(),
+        "query_feats": stage1_text.cpu().half(),
+    }
+    if len(cache["query_labels"]) != topk_idx.size(0):
+        raise ValueError("query_labels length does not match the query count")
+    if has_ground_truth:
+        fallback = torch.full(
+            (topk_idx.size(0),), len(enc["gallery_ids"]), dtype=torch.long
+        )
+        cache.update({
+            "gt_pos": enc["gt_pos"].cpu().long(),
+            "pe_raw_ranks": candidates.get("pe_raw_ranks", fallback).cpu().long(),
+            "pe_selected_ranks": candidates.get(
+                "pe_selected_ranks", candidates.get("stage1_ranks", fallback)
+            ).cpu().long(),
+            "fallback_ranks": candidates.get("stage1_ranks", fallback).cpu().long(),
+        })
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(cache, cache_path)
+    print(f"[cache 3/3] Saved: {cache_path}", flush=True)
+    return cache, False
+
+
+def _row_minmax(values: Tensor) -> Tensor:
+    values = values.float()
+    low = values.min(dim=1, keepdim=True).values
+    high = values.max(dim=1, keepdim=True).values
+    return (values - low) / (high - low).clamp_min(1e-12)
+
+
+def _row_zscore(values: Tensor) -> Tensor:
+    values = values.float()
+    return (values - values.mean(dim=1, keepdim=True)) / values.std(
+        dim=1, keepdim=True, unbiased=False
+    ).clamp_min(1e-6)
+
+
+def _rank_matrix(values: Tensor) -> Tensor:
+    order = values.float().argsort(dim=1, descending=True)
+    ranks = torch.empty_like(order)
+    rank_values = torch.arange(1, values.size(1) + 1).expand_as(order)
+    ranks.scatter_(1, order, rank_values)
+    return ranks
+
+
+def _reciprocal_swap_count(order: Tensor, gallery_ids: list[str],
+                           query_image_ids: list[str]) -> int:
+    query_pos = {str(value): i for i, value in enumerate(query_image_ids)}
+    top_ids = [str(gallery_ids[int(row[0])]) for row in order]
+    pairs = set()
+    for i, value in enumerate(top_ids):
+        j = query_pos.get(value)
+        if j is not None and j != i and top_ids[j] == str(query_image_ids[i]):
+            pairs.add(tuple(sorted((i, j))))
+    return len(pairs)
+
+
+def _transition_counts(reference_order: Tensor, order: Tensor, gt_pos: Tensor) -> dict:
+    ref_ok = reference_order[:, 0].eq(gt_pos)
+    out_ok = order[:, 0].eq(gt_pos)
+    return {
+        "both_correct": int((ref_ok & out_ok).sum()),
+        "helped": int((~ref_ok & out_ok).sum()),
+        "harmed": int((ref_ok & ~out_ok).sum()),
+        "both_wrong": int((~ref_ok & ~out_ok).sum()),
+    }
+
+
+def evaluate_cached_rerank(cache: dict, retrieval_scores: Tensor,
+                           fusion_family: str = "legacy",
+                           fusion_weight: float = 1.0,
+                           rank_constant: int = 20,
+                           postprocesses=("rerank",),
+                           reference_order: Tensor | None = None,
+                           include_top10: bool = True) -> dict:
+    """Evaluate score fusion and postprocessing using no model forward calls."""
+    allowed_fusion = {"legacy", "calibrated", "rank"}
+    allowed_post = {"rerank", "greedy_sca", "gale_shapley"}
+    if fusion_family not in allowed_fusion:
+        raise ValueError(f"fusion_family must be one of {sorted(allowed_fusion)}")
+    postprocesses = tuple(dict.fromkeys(postprocesses))
+    unknown = set(postprocesses).difference(allowed_post)
+    if unknown:
+        raise ValueError(f"Unknown postprocesses: {sorted(unknown)}")
+
+    itm = torch.as_tensor(cache["itm_logits"]).float()
+    retrieval = torch.as_tensor(retrieval_scores).float()
+    indices = torch.as_tensor(cache["candidate_indices"]).long()
+    if itm.shape != retrieval.shape or itm.shape != indices.shape:
+        raise ValueError("ITM, retrieval, and candidate tensors must have the same shape")
+
+    weight = float(fusion_weight)
+    if fusion_family == "legacy":
+        itm_component = itm
+        retrieval_component = _row_minmax(retrieval)
+        final = itm_component + weight * retrieval_component
+    elif fusion_family == "calibrated":
+        itm_component = _row_zscore(itm)
+        retrieval_component = _row_zscore(retrieval)
+        final = itm_component + weight * retrieval_component
+    else:
+        itm_ranks = _rank_matrix(itm).float()
+        retrieval_ranks = _rank_matrix(retrieval).float()
+        itm_component = 1.0 / (float(rank_constant) + itm_ranks)
+        retrieval_component = 1.0 / (float(rank_constant) + retrieval_ranks)
+        final = itm_component + weight * retrieval_component
+
+    order_in_k = final.argsort(dim=1, descending=True)
+    order_rerank = torch.gather(indices, 1, order_in_k)
+    scores_rerank = torch.gather(final, 1, order_in_k)
+    gallery_ids = [str(value) for value in cache["gallery_ids"]]
+    query_ids = [str(value) for value in cache["query_image_ids"]]
+    output = {
+        "fusion_family": fusion_family,
+        "fusion_weight": weight,
+        "rank_constant": int(rank_constant),
+        "orders": {"rerank": order_rerank},
+        "scores": {"rerank": scores_rerank},
+        "top10_by_stage": {},
+        "diagnostics": {
+            "score_calibration": score_calibration_report(
+                itm_component, retrieval_component, final, weight
+            ),
+            "rerank_top1_conflicts": top1_conflict_count(order_rerank),
+            "rerank_reciprocal_swap_pairs": _reciprocal_swap_count(
+                order_rerank, gallery_ids, query_ids
+            ),
+        },
+    }
+    if include_top10:
+        output["top10_by_stage"]["rerank"] = build_top10(
+            order_rerank, None, gallery_ids
+        )
+    has_gt = bool(cache.get("metadata", {}).get("has_ground_truth"))
+    if has_gt:
+        gt_pos = torch.as_tensor(cache["gt_pos"]).long()
+        fallback = torch.as_tensor(cache["fallback_ranks"]).long()
+        retrieval_order = torch.gather(
+            indices, 1, retrieval.argsort(dim=1, descending=True)
+        )
+        retrieval_ranks = ranks_after_order(retrieval_order, gt_pos, fallback)
+        rerank_ranks = ranks_after_order(order_rerank, gt_pos, fallback)
+        output["retrieval"] = report_from_ranks(retrieval_ranks)
+        output["rerank"] = report_from_ranks(rerank_ranks)
+        output["ranks"] = {"retrieval": retrieval_ranks, "rerank": rerank_ranks}
+        output["diagnostics"].update({
+            "retrieval_gt_at_rank2": int(retrieval_ranks.eq(2).sum()),
+            "rerank_gt_at_rank2": int(rerank_ranks.eq(2).sum()),
+        })
+        if reference_order is not None:
+            output["diagnostics"]["transitions_vs_reference"] = _transition_counts(
+                reference_order, order_rerank, gt_pos
+            )
+
+    if "greedy_sca" in postprocesses:
+        sca_order, _ = greedy_sca(
+            order_rerank, scores_rerank,
+            query_feats=torch.as_tensor(cache["query_feats"]).float(),
+        )
+        output["orders"]["greedy_sca"] = sca_order
+        output["scores"]["greedy_sca"] = scores_for_order(
+            indices, final, sca_order
+        )
+        if include_top10:
+            output["top10_by_stage"]["greedy_sca"] = build_top10(
+                sca_order, None, gallery_ids
+            )
+        output["diagnostics"]["greedy_sca_top1_conflicts"] = top1_conflict_count(
+            sca_order
+        )
+        output["diagnostics"]["greedy_sca_reciprocal_swap_pairs"] = (
+            _reciprocal_swap_count(sca_order, gallery_ids, query_ids)
+        )
+        if has_gt:
+            ranks = ranks_after_order(
+                sca_order, torch.as_tensor(cache["gt_pos"]).long(),
+                torch.as_tensor(cache["fallback_ranks"]).long(),
+            )
+            output["greedy_sca"] = report_from_ranks(ranks)
+            output["ranks"]["greedy_sca"] = ranks
+            output["diagnostics"]["greedy_sca_gt_at_rank2"] = int(ranks.eq(2).sum())
+            if reference_order is not None:
+                output["diagnostics"]["greedy_sca_transitions_vs_reference"] = (
+                    _transition_counts(reference_order, sca_order,
+                                       torch.as_tensor(cache["gt_pos"]).long())
+                )
+
+    if "gale_shapley" in postprocesses:
+        matched = gale_shapley_match(order_rerank, scores_rerank)
+        if has_gt:
+            rerank_ranks = output["ranks"]["rerank"]
+            gs_ranks, gs_order = apply_gale_shapley(
+                order_rerank, matched, rerank_ranks,
+                torch.as_tensor(cache["gt_pos"]).long(),
+            )
+            output["gale_shapley"] = report_from_ranks(gs_ranks)
+            output["ranks"]["gale_shapley"] = gs_ranks
+            output["diagnostics"]["gale_shapley_gt_at_rank2"] = int(
+                gs_ranks.eq(2).sum()
+            )
+        else:
+            dummy_ranks = torch.ones(order_rerank.size(0), dtype=torch.long)
+            dummy_gt = torch.full((order_rerank.size(0),), -1, dtype=torch.long)
+            _, gs_order = apply_gale_shapley(
+                order_rerank, matched, dummy_ranks, dummy_gt
+            )
+        output["orders"]["gale_shapley"] = gs_order
+        output["scores"]["gale_shapley"] = scores_for_order(
+            indices, final, gs_order
+        )
+        if include_top10:
+            output["top10_by_stage"]["gale_shapley"] = build_top10(
+                gs_order, None, gallery_ids
+            )
+        output["diagnostics"]["gale_shapley_top1_conflicts"] = top1_conflict_count(
+            gs_order
+        )
+        output["diagnostics"]["gale_shapley_reciprocal_swap_pairs"] = (
+            _reciprocal_swap_count(gs_order, gallery_ids, query_ids)
+        )
+        if has_gt and reference_order is not None:
+            output["diagnostics"]["gale_shapley_transitions_vs_reference"] = (
+                _transition_counts(reference_order, gs_order,
+                                   torch.as_tensor(cache["gt_pos"]).long())
+            )
+    return output
 
 
 # --------------------------------------------------------------------------- orchestrator

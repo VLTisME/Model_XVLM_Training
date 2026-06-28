@@ -154,6 +154,107 @@ def test_pipeline_accepts_precomputed_candidate_payload(tmp_path):
     assert all(len(row) == 10 for row in res["top10"])
 
 
+def test_cached_rerank_reproduces_pipeline_and_reuses_valid_cache(tmp_path):
+    """Cached ITM logits reproduce the legacy additive path without another model pass."""
+    import numpy as np
+    import pandas as pd
+    from PIL import Image
+    from star.config import Config
+    from star.data import PABDataset
+    from star.inference import (evaluate_cached_rerank, load_valid_rerank_cache,
+                                prepare_rerank_cache, run_pipeline)
+    from star.models import STARModel
+
+    rng = np.random.default_rng(19)
+    rows = []
+    for i in range(12):
+        Image.fromarray((rng.random((64, 64, 3)) * 255).astype("uint8")).save(
+            tmp_path / f"g{i}.jpg"
+        )
+        rows.append(dict(
+            image_path=f"g{i}.jpg", caption=f"query {i}" if i < 4 else "",
+            split="valb", sequence_id=f"s{i}", scene=f"s{i}", action="x",
+            image_id=f"img{i}", bbox=None, keypoints=None,
+        ))
+    manifest = tmp_path / "cached.parquet"
+    pd.DataFrame(rows).to_parquet(manifest, index=False)
+
+    cfg = Config()
+    cfg.model.backbone = "dummy"
+    cfg.model.embed_dim = 32
+    model = STARModel(cfg)
+    ds = PABDataset(
+        str(manifest), str(tmp_path), model.backbone.tokenizer,
+        split="valb", train=False,
+    )
+    candidate_ids = [
+        [f"img{q}", "img4", "img5", "img6", "img7", "img8", "img9", "img10", "img11", f"img{(q + 1) % 4}"]
+        for q in range(4)
+    ]
+    scores = torch.linspace(1.0, 0.0, 10).repeat(4, 1)
+    payload = {
+        "query_image_ids": [f"img{i}" for i in range(4)],
+        "candidate_image_ids": candidate_ids,
+        "candidate_scores": scores,
+        "candidate_hash": "cache-test-candidates",
+        "pe_raw_ranks": torch.ones(4, dtype=torch.long),
+        "stage1_ranks": torch.ones(4, dtype=torch.long),
+        "metadata": {"mode": "raw"},
+    }
+    fingerprint = {"manifest": "semantic-19", "checkpoint": "dummy-32"}
+    cache_path = tmp_path / "itm_cache.pt"
+    cache, reused = prepare_rerank_cache(
+        model, ds, "cpu", payload, cache_path, topk=10,
+        batch_size=4, num_workers=0, cache_fingerprint=fingerprint,
+    )
+    assert not reused and cache_path.is_file()
+
+    legacy = run_pipeline(
+        model, ds, "cpu", topk=10, batch_size=4, num_workers=0,
+        candidate_payload=payload, stage1_weight=0.25,
+    )
+    cached = evaluate_cached_rerank(
+        cache, scores, fusion_family="legacy", fusion_weight=0.25,
+        postprocesses=("rerank", "greedy_sca", "gale_shapley"),
+    )
+    for stage in ("rerank", "greedy_sca", "gale_shapley"):
+        assert cached[stage] == legacy[stage]
+        assert cached["top10_by_stage"][stage] == legacy["top10_by_stage"][stage]
+
+    loaded, reused = prepare_rerank_cache(
+        None, None, "cpu", payload, cache_path, topk=10,
+        cache_fingerprint=fingerprint,
+    )
+    assert reused and torch.equal(loaded["itm_logits"], cache["itm_logits"])
+    assert load_valid_rerank_cache(
+        cache_path, payload, 10, {**fingerprint, "checkpoint": "changed"}
+    ) is None
+
+
+def test_cached_rerank_fusion_families_are_cpu_only_and_finite():
+    from star.inference import evaluate_cached_rerank
+
+    cache = {
+        "metadata": {"has_ground_truth": True},
+        "gallery_ids": ["g0", "g1", "g2"],
+        "query_image_ids": ["g0", "g1"],
+        "candidate_image_ids": [["g0", "g1", "g2"], ["g1", "g0", "g2"]],
+        "candidate_indices": torch.tensor([[0, 1, 2], [1, 0, 2]]),
+        "pe_scores": torch.tensor([[0.9, 0.8, 0.1], [0.9, 0.7, 0.2]]),
+        "itm_logits": torch.tensor([[0.2, 0.8, -0.1], [0.1, 0.4, -0.2]]),
+        "query_feats": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        "gt_pos": torch.tensor([0, 1]),
+        "fallback_ranks": torch.ones(2, dtype=torch.long),
+    }
+    for family in ("legacy", "calibrated", "rank"):
+        result = evaluate_cached_rerank(
+            cache, cache["pe_scores"], fusion_family=family,
+            fusion_weight=1.0, postprocesses=("rerank",),
+        )
+        assert result["orders"]["rerank"].device.type == "cpu"
+        assert torch.isfinite(result["scores"]["rerank"]).all()
+
+
 def _make_dummy_eval(tmp_path, captions, seed=0):
     """Write a tiny eval manifest + jpgs; `captions[i]` ("" => distractor) drives is_query."""
     import numpy as np
