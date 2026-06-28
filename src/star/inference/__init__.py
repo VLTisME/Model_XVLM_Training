@@ -1,5 +1,6 @@
 from .pipeline import (
     apply_gale_shapley,
+    confidence_locked_gale_shapley,
     encode_eval_set,
     gale_shapley_match,
     apply_sinkhorn_or_dbsn,
@@ -11,6 +12,7 @@ from .pipeline import (
     pairwise_features,
     pairwise_rerank,
     prepare_rerank_cache,
+    retrieval_guided_cycle_rescue,
     ranks_after_rerank,
     report_from_ranks,
     rrf_fuse,
@@ -33,6 +35,8 @@ __all__ = [
     "gale_shapley_match",
     "apply_sinkhorn_or_dbsn",
     "apply_gale_shapley",
+    "confidence_locked_gale_shapley",
+    "retrieval_guided_cycle_rescue",
     "pairwise_features",
     "pairwise_rerank",
     "rrf_fuse",

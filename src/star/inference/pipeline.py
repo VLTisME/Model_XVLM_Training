@@ -561,6 +561,74 @@ def gale_shapley_match(order: Tensor, scores: Tensor) -> Tensor:
     return matched
 
 
+def confidence_locked_gale_shapley(order: Tensor, scores: Tensor,
+                                   min_margin: float = 0.5,
+                                   lock_mask: Tensor | None = None) -> Tensor:
+    """Gale-Shapley with high-confidence top-1 claims reserved first.
+
+    Standard Gale-Shapley compares absolute scores across queries. Even after row-wise
+    calibration, that can displace a query that has a decisive within-row preference.
+    This variant locks at most one high-margin claimant per image, then runs deferred
+    acceptance for all remaining queries. Setting ``min_margin=inf`` is equivalent to
+    ordinary Gale-Shapley.
+    """
+    Q, K = order.shape
+    if scores.shape != order.shape:
+        raise ValueError("order and scores must have the same shape")
+    if lock_mask is not None:
+        lock_mask = torch.as_tensor(lock_mask).bool().reshape(-1)
+        if lock_mask.numel() != Q:
+            raise ValueError("lock_mask must contain one value per query")
+    margins = (
+        scores[:, 0] - scores[:, 1]
+        if K > 1 else torch.full((Q,), float("inf"), dtype=scores.dtype)
+    )
+    claimants: dict[int, list[int]] = {}
+    for q in range(Q):
+        if (
+            float(margins[q]) >= float(min_margin)
+            and (lock_mask is None or bool(lock_mask[q]))
+        ):
+            claimants.setdefault(int(order[q, 0]), []).append(q)
+
+    locked_by_image: dict[int, int] = {}
+    locked_queries = set()
+    for gid, queries in claimants.items():
+        winner = max(
+            queries,
+            key=lambda q: (float(margins[q]), float(scores[q, 0])),
+        )
+        locked_by_image[gid] = winner
+        locked_queries.add(winner)
+
+    next_choice = [0] * Q
+    holder = dict(locked_by_image)
+    hold_score = {gid: float("inf") for gid in locked_by_image}
+    free = [q for q in range(Q) if q not in locked_queries]
+    while free:
+        q = free.pop()
+        while next_choice[q] < K:
+            pos = next_choice[q]
+            gid = int(order[q, pos])
+            score = float(scores[q, pos])
+            next_choice[q] += 1
+            if gid in locked_by_image:
+                continue
+            if gid not in holder:
+                holder[gid], hold_score[gid] = q, score
+                break
+            if score > hold_score[gid]:
+                loser = holder[gid]
+                holder[gid], hold_score[gid] = q, score
+                free.append(loser)
+                break
+
+    matched = torch.full((Q,), -1, dtype=torch.long)
+    for gid, q in holder.items():
+        matched[q] = gid
+    return matched
+
+
 def apply_gale_shapley(order: Tensor, matched: Tensor, ranks_in: Tensor,
                        gt_pos: Tensor) -> tuple[Tensor, Tensor]:
     """Move each query's matched image to rank 1 (keep ranks 2..K from the rerank order).
@@ -584,6 +652,107 @@ def apply_gale_shapley(order: Tensor, matched: Tensor, ranks_in: Tensor,
             ranks[qi] = ranks_in[qi] + 1             # an item from BELOW GT jumped above it
         # matched already above GT (pos_m < rank) or GT outside the block -> rank unchanged
     return ranks, new_order
+
+
+def retrieval_guided_cycle_rescue(
+    order: Tensor,
+    final_scores: Tensor,
+    retrieval_scores: Tensor,
+    query_feats: Tensor,
+    text_sim_threshold: float = 0.94,
+    candidate_depth: int = 3,
+    max_final_penalty: float = 0.35,
+    min_retrieval_gain: float = 0.05,
+    query_similarity: Tensor | None = None,
+) -> tuple[Tensor, dict[str, float | int]]:
+    """Swap crossed top-1 assignments when retrieval provides contrary evidence.
+
+    The target failure is a pair of highly similar normal/anomaly queries that retrieve
+    each other's image. Gale-Shapley sees two unique assignments and leaves the cycle
+    untouched. This method considers only crossed candidates near the top of both lists,
+    permits a swap only when retrieval prefers it, and caps the loss in fused score.
+    Query pairs are selected greedily and cannot overlap.
+    """
+    if not (order.shape == final_scores.shape == retrieval_scores.shape):
+        raise ValueError("order, final_scores, and retrieval_scores must align")
+    Q, K = order.shape
+    if Q < 2 or K < 2:
+        return order.clone(), {"cycle_candidates": 0, "cycle_swaps": 0}
+    depth = max(2, min(int(candidate_depth), K))
+    if query_similarity is None:
+        feats = torch.nn.functional.normalize(query_feats.float(), dim=1)
+        qsim = feats @ feats.t()
+    else:
+        qsim = torch.as_tensor(query_similarity).float()
+        if qsim.shape != (Q, Q):
+            raise ValueError("query_similarity must have shape [Q, Q]")
+
+    final_lookup = []
+    retrieval_lookup = []
+    top_sets = []
+    for q in range(Q):
+        ids = [int(value) for value in order[q, :depth].tolist()]
+        top_sets.append(set(ids))
+        final_lookup.append({
+            gid: float(final_scores[q, pos]) for pos, gid in enumerate(ids)
+        })
+        retrieval_lookup.append({
+            gid: float(retrieval_scores[q, pos]) for pos, gid in enumerate(ids)
+        })
+
+    proposals = []
+    for i in range(Q):
+        ai = int(order[i, 0])
+        for j in range(i + 1, Q):
+            if float(qsim[i, j]) < float(text_sim_threshold):
+                continue
+            aj = int(order[j, 0])
+            if ai == aj or aj not in top_sets[i] or ai not in top_sets[j]:
+                continue
+            current_final = final_lookup[i][ai] + final_lookup[j][aj]
+            swapped_final = final_lookup[i][aj] + final_lookup[j][ai]
+            final_penalty = current_final - swapped_final
+            current_retrieval = retrieval_lookup[i][ai] + retrieval_lookup[j][aj]
+            swapped_retrieval = retrieval_lookup[i][aj] + retrieval_lookup[j][ai]
+            retrieval_gain = swapped_retrieval - current_retrieval
+            if (
+                final_penalty <= float(max_final_penalty)
+                and retrieval_gain >= float(min_retrieval_gain)
+            ):
+                utility = retrieval_gain - max(final_penalty, 0.0)
+                proposals.append((utility, retrieval_gain, -final_penalty, i, j))
+
+    proposals.sort(reverse=True)
+    selected = []
+    used = set()
+    for _, retrieval_gain, neg_penalty, i, j in proposals:
+        if i in used or j in used:
+            continue
+        selected.append((i, j, retrieval_gain, -neg_penalty))
+        used.update((i, j))
+
+    new_order = order.clone()
+    for i, j, _, _ in selected:
+        ai, aj = int(new_order[i, 0]), int(new_order[j, 0])
+        row_i = new_order[i].tolist()
+        row_j = new_order[j].tolist()
+        new_order[i] = torch.tensor(
+            [aj] + [value for value in row_i if int(value) != aj], dtype=order.dtype
+        )
+        new_order[j] = torch.tensor(
+            [ai] + [value for value in row_j if int(value) != ai], dtype=order.dtype
+        )
+    diagnostics = {
+        "cycle_candidates": len(proposals),
+        "cycle_swaps": len(selected),
+        "cycle_mean_retrieval_gain": (
+            sum(value[2] for value in selected) / len(selected) if selected else 0.0
+        ),
+        "cycle_mean_final_penalty": (
+            sum(value[3] for value in selected) / len(selected) if selected else 0.0
+        ),
+    }
+    return new_order, diagnostics
 
 
 # --------------------------------------------------------------------------- (pairwise / duo)
@@ -643,7 +812,7 @@ def report_from_ranks(ranks: Tensor, ks=(1, 5, 10, 50, 200)) -> dict[str, float]
 
 
 def score_calibration_report(itm: Tensor, stage1: Tensor, final: Tensor,
-                             stage1_weight: float) -> dict[str, float | int]:
+                             stage1_weight: float | Tensor) -> dict[str, float | int]:
     """Describe whether the normalized Stage-1 prior materially changes ITM rankings."""
     def stats(prefix: str, values: Tensor) -> dict[str, float]:
         values = values.float()
@@ -660,12 +829,25 @@ def score_calibration_report(itm: Tensor, stage1: Tensor, final: Tensor,
         top2 = values.float().topk(2, dim=1).values
         return float((top2[:, 0] - top2[:, 1]).median())
 
-    weighted = float(stage1_weight) * stage1.float()
+    if torch.is_tensor(stage1_weight):
+        weights = stage1_weight.float().reshape(-1, 1)
+        if weights.size(0) != stage1.size(0):
+            raise ValueError("Per-query Stage-1 weights must match the query count")
+        weighted = weights * stage1.float()
+        weight_summary = {
+            "stage1_weight": float(weights.median()),
+            "stage1_weight_min": float(weights.min()),
+            "stage1_weight_max": float(weights.max()),
+            "stage1_weight_mean": float(weights.mean()),
+        }
+    else:
+        weighted = float(stage1_weight) * stage1.float()
+        weight_summary = {"stage1_weight": float(stage1_weight)}
     report = {
         **stats("itm", itm),
         **stats("stage1", stage1),
         **stats("weighted_stage1", weighted),
-        "stage1_weight": float(stage1_weight),
+        **weight_summary,
         "itm_median_top2_gap": median_top2_gap(itm),
         "stage1_median_top2_gap": median_top2_gap(stage1),
         "final_median_top2_gap": median_top2_gap(final),
@@ -913,11 +1095,15 @@ def evaluate_cached_rerank(cache: dict, retrieval_scores: Tensor,
                            fusion_weight: float = 1.0,
                            rank_constant: int = 20,
                            postprocesses=("rerank",),
+                           postprocess_options: dict | None = None,
                            reference_order: Tensor | None = None,
                            include_top10: bool = True) -> dict:
     """Evaluate score fusion and postprocessing using no model forward calls."""
-    allowed_fusion = {"legacy", "calibrated", "rank"}
-    allowed_post = {"rerank", "greedy_sca", "gale_shapley"}
+    allowed_fusion = {"legacy", "calibrated", "adaptive", "rank"}
+    allowed_post = {
+        "rerank", "greedy_sca", "gale_shapley",
+        "locked_gale_shapley", "gale_shapley_cycle_rescue",
+    }
     if fusion_family not in allowed_fusion:
         raise ValueError(f"fusion_family must be one of {sorted(allowed_fusion)}")
     postprocesses = tuple(dict.fromkeys(postprocesses))
@@ -935,33 +1121,58 @@ def evaluate_cached_rerank(cache: dict, retrieval_scores: Tensor,
     if fusion_family == "legacy":
         itm_component = itm
         retrieval_component = _row_minmax(retrieval)
-        final = itm_component + weight * retrieval_component
+        effective_weight: float | Tensor = weight
+        final = itm_component + effective_weight * retrieval_component
     elif fusion_family == "calibrated":
         itm_component = _row_zscore(itm)
         retrieval_component = _row_zscore(retrieval)
-        final = itm_component + weight * retrieval_component
+        effective_weight = weight
+        final = itm_component + effective_weight * retrieval_component
+    elif fusion_family == "adaptive":
+        itm_component = _row_zscore(itm)
+        retrieval_component = _row_zscore(retrieval)
+        itm_top2 = itm_component.topk(2, dim=1).values
+        retrieval_top2 = retrieval_component.topk(2, dim=1).values
+        itm_gap = (itm_top2[:, 0] - itm_top2[:, 1]).clamp_min(1e-4)
+        retrieval_gap = (retrieval_top2[:, 0] - retrieval_top2[:, 1]).clamp_min(1e-4)
+        confidence_ratio = torch.sqrt(retrieval_gap / itm_gap).clamp(0.5, 2.0)
+        effective_weight = weight * confidence_ratio
+        final = itm_component + effective_weight[:, None] * retrieval_component
     else:
         itm_ranks = _rank_matrix(itm).float()
         retrieval_ranks = _rank_matrix(retrieval).float()
         itm_component = 1.0 / (float(rank_constant) + itm_ranks)
         retrieval_component = 1.0 / (float(rank_constant) + retrieval_ranks)
-        final = itm_component + weight * retrieval_component
+        effective_weight = weight
+        final = itm_component + effective_weight * retrieval_component
 
     order_in_k = final.argsort(dim=1, descending=True)
     order_rerank = torch.gather(indices, 1, order_in_k)
     scores_rerank = torch.gather(final, 1, order_in_k)
+    retrieval_order_in_k = retrieval.argsort(dim=1, descending=True)
+    retrieval_order = torch.gather(indices, 1, retrieval_order_in_k)
+    itm_order_in_k = itm.argsort(dim=1, descending=True)
+    itm_order = torch.gather(indices, 1, itm_order_in_k)
     gallery_ids = [str(value) for value in cache["gallery_ids"]]
     query_ids = [str(value) for value in cache["query_image_ids"]]
     output = {
         "fusion_family": fusion_family,
         "fusion_weight": weight,
         "rank_constant": int(rank_constant),
-        "orders": {"rerank": order_rerank},
-        "scores": {"rerank": scores_rerank},
+        "orders": {
+            "retrieval": retrieval_order,
+            "itm": itm_order,
+            "rerank": order_rerank,
+        },
+        "scores": {
+            "retrieval": torch.gather(retrieval, 1, retrieval_order_in_k),
+            "itm": torch.gather(itm, 1, itm_order_in_k),
+            "rerank": scores_rerank,
+        },
         "top10_by_stage": {},
         "diagnostics": {
             "score_calibration": score_calibration_report(
-                itm_component, retrieval_component, final, weight
+                itm_component, retrieval_component, final, effective_weight
             ),
             "rerank_top1_conflicts": top1_conflict_count(order_rerank),
             "rerank_reciprocal_swap_pairs": _reciprocal_swap_count(
@@ -977,16 +1188,20 @@ def evaluate_cached_rerank(cache: dict, retrieval_scores: Tensor,
     if has_gt:
         gt_pos = torch.as_tensor(cache["gt_pos"]).long()
         fallback = torch.as_tensor(cache["fallback_ranks"]).long()
-        retrieval_order = torch.gather(
-            indices, 1, retrieval.argsort(dim=1, descending=True)
-        )
         retrieval_ranks = ranks_after_order(retrieval_order, gt_pos, fallback)
+        itm_ranks = ranks_after_order(itm_order, gt_pos, fallback)
         rerank_ranks = ranks_after_order(order_rerank, gt_pos, fallback)
         output["retrieval"] = report_from_ranks(retrieval_ranks)
+        output["itm"] = report_from_ranks(itm_ranks)
         output["rerank"] = report_from_ranks(rerank_ranks)
-        output["ranks"] = {"retrieval": retrieval_ranks, "rerank": rerank_ranks}
+        output["ranks"] = {
+            "retrieval": retrieval_ranks,
+            "itm": itm_ranks,
+            "rerank": rerank_ranks,
+        }
         output["diagnostics"].update({
             "retrieval_gt_at_rank2": int(retrieval_ranks.eq(2).sum()),
+            "itm_gt_at_rank2": int(itm_ranks.eq(2).sum()),
             "rerank_gt_at_rank2": int(rerank_ranks.eq(2).sum()),
         })
         if reference_order is not None:
@@ -1065,6 +1280,134 @@ def evaluate_cached_rerank(cache: dict, retrieval_scores: Tensor,
                 _transition_counts(reference_order, gs_order,
                                    torch.as_tensor(cache["gt_pos"]).long())
             )
+
+    options = dict(postprocess_options or {})
+    if "locked_gale_shapley" in postprocesses:
+        lock_margin = float(options.get("lock_margin", 0.5))
+        require_agreement = bool(options.get("require_component_agreement", False))
+        lock_mask = (
+            retrieval_order[:, 0].eq(itm_order[:, 0])
+            if require_agreement else None
+        )
+        matched = confidence_locked_gale_shapley(
+            order_rerank, scores_rerank, min_margin=lock_margin,
+            lock_mask=lock_mask,
+        )
+        if has_gt:
+            ranks, locked_order = apply_gale_shapley(
+                order_rerank, matched, output["ranks"]["rerank"],
+                torch.as_tensor(cache["gt_pos"]).long(),
+            )
+            output["locked_gale_shapley"] = report_from_ranks(ranks)
+            output["ranks"]["locked_gale_shapley"] = ranks
+            output["diagnostics"]["locked_gale_shapley_gt_at_rank2"] = int(
+                ranks.eq(2).sum()
+            )
+        else:
+            dummy_ranks = torch.ones(order_rerank.size(0), dtype=torch.long)
+            dummy_gt = torch.full((order_rerank.size(0),), -1, dtype=torch.long)
+            _, locked_order = apply_gale_shapley(
+                order_rerank, matched, dummy_ranks, dummy_gt
+            )
+        output["orders"]["locked_gale_shapley"] = locked_order
+        output["scores"]["locked_gale_shapley"] = scores_for_order(
+            indices, final, locked_order
+        )
+        if include_top10:
+            output["top10_by_stage"]["locked_gale_shapley"] = build_top10(
+                locked_order, None, gallery_ids
+            )
+        output["diagnostics"]["locked_gale_shapley_top1_conflicts"] = (
+            top1_conflict_count(locked_order)
+        )
+        output["diagnostics"]["locked_gale_shapley_reciprocal_swap_pairs"] = (
+            _reciprocal_swap_count(locked_order, gallery_ids, query_ids)
+        )
+        output["diagnostics"]["locked_gale_shapley_lock_margin"] = lock_margin
+        output["diagnostics"]["locked_gale_shapley_require_component_agreement"] = (
+            require_agreement
+        )
+        output["diagnostics"]["locked_gale_shapley_consensus_queries"] = (
+            int(lock_mask.sum()) if lock_mask is not None else None
+        )
+        if has_gt and reference_order is not None:
+            output["diagnostics"]["locked_gale_shapley_transitions_vs_reference"] = (
+                _transition_counts(
+                    reference_order, locked_order,
+                    torch.as_tensor(cache["gt_pos"]).long(),
+                )
+            )
+
+    if "gale_shapley_cycle_rescue" in postprocesses:
+        if "gale_shapley" in output["orders"]:
+            gs_order = output["orders"]["gale_shapley"]
+        else:
+            matched = gale_shapley_match(order_rerank, scores_rerank)
+            if has_gt:
+                _, gs_order = apply_gale_shapley(
+                    order_rerank, matched, output["ranks"]["rerank"],
+                    torch.as_tensor(cache["gt_pos"]).long(),
+                )
+            else:
+                dummy_ranks = torch.ones(order_rerank.size(0), dtype=torch.long)
+                dummy_gt = torch.full((order_rerank.size(0),), -1, dtype=torch.long)
+                _, gs_order = apply_gale_shapley(
+                    order_rerank, matched, dummy_ranks, dummy_gt
+                )
+        gs_final_scores = scores_for_order(indices, final, gs_order)
+        retrieval_z = _row_zscore(retrieval)
+        gs_retrieval_scores = scores_for_order(indices, retrieval_z, gs_order)
+        if "_query_similarity" not in cache:
+            query_feats = torch.nn.functional.normalize(
+                torch.as_tensor(cache["query_feats"]).float(), dim=1
+            )
+            cache["_query_similarity"] = query_feats @ query_feats.t()
+        cycle_order, cycle_diag = retrieval_guided_cycle_rescue(
+            gs_order,
+            gs_final_scores,
+            gs_retrieval_scores,
+            torch.as_tensor(cache["query_feats"]).float(),
+            text_sim_threshold=float(options.get("text_sim_threshold", 0.94)),
+            candidate_depth=int(options.get("candidate_depth", 3)),
+            max_final_penalty=float(options.get("max_final_penalty", 0.35)),
+            min_retrieval_gain=float(options.get("min_retrieval_gain", 0.05)),
+            query_similarity=cache["_query_similarity"],
+        )
+        output["orders"]["gale_shapley_cycle_rescue"] = cycle_order
+        output["scores"]["gale_shapley_cycle_rescue"] = scores_for_order(
+            indices, final, cycle_order
+        )
+        if include_top10:
+            output["top10_by_stage"]["gale_shapley_cycle_rescue"] = build_top10(
+                cycle_order, None, gallery_ids
+            )
+        output["diagnostics"].update({
+            f"gale_shapley_cycle_rescue_{key}": value
+            for key, value in cycle_diag.items()
+        })
+        output["diagnostics"]["gale_shapley_cycle_rescue_top1_conflicts"] = (
+            top1_conflict_count(cycle_order)
+        )
+        output["diagnostics"]["gale_shapley_cycle_rescue_reciprocal_swap_pairs"] = (
+            _reciprocal_swap_count(cycle_order, gallery_ids, query_ids)
+        )
+        if has_gt:
+            ranks = ranks_after_order(
+                cycle_order, torch.as_tensor(cache["gt_pos"]).long(),
+                torch.as_tensor(cache["fallback_ranks"]).long(),
+            )
+            output["gale_shapley_cycle_rescue"] = report_from_ranks(ranks)
+            output["ranks"]["gale_shapley_cycle_rescue"] = ranks
+            output["diagnostics"]["gale_shapley_cycle_rescue_gt_at_rank2"] = int(
+                ranks.eq(2).sum()
+            )
+            if reference_order is not None:
+                output["diagnostics"][
+                    "gale_shapley_cycle_rescue_transitions_vs_reference"
+                ] = _transition_counts(
+                    reference_order, cycle_order,
+                    torch.as_tensor(cache["gt_pos"]).long(),
+                )
     return output
 
 

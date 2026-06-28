@@ -8,6 +8,7 @@ import json
 import math
 import resource
 import shutil
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -25,13 +26,99 @@ RETRIEVAL_CONFIGS = [
     {"name": "rrf_pe_primary", "constant": 20, "pe": 3.0, "siglip2": 0.75, "dfn": 1.0},
     {"name": "rrf_pe_conservative", "constant": 60, "pe": 3.0, "siglip2": 0.5, "dfn": 1.0},
     {"name": "rrf_map_candidate", "constant": 10, "pe": 2.0, "siglip2": 0.5, "dfn": 0.75},
+    {"name": "rrf_map_c5", "constant": 5, "pe": 2.0, "siglip2": 0.5, "dfn": 0.75},
+    {"name": "rrf_map_c7p5", "constant": 7.5, "pe": 2.0, "siglip2": 0.5, "dfn": 0.75},
+    {"name": "rrf_map_c15", "constant": 15, "pe": 2.0, "siglip2": 0.5, "dfn": 0.75},
+    {"name": "rrf_map_c20", "constant": 20, "pe": 2.0, "siglip2": 0.5, "dfn": 0.75},
+    {"name": "rrf_pe_2p25", "constant": 10, "pe": 2.25, "siglip2": 0.5, "dfn": 0.75},
+    {"name": "rrf_pe_2p5", "constant": 10, "pe": 2.5, "siglip2": 0.5, "dfn": 0.75},
+    {"name": "rrf_pe_2p75", "constant": 10, "pe": 2.75, "siglip2": 0.5, "dfn": 0.75},
+    {"name": "rrf_pe_3", "constant": 10, "pe": 3.0, "siglip2": 0.5, "dfn": 0.75},
+    {"name": "rrf_sig_light", "constant": 10, "pe": 2.0, "siglip2": 0.4, "dfn": 0.75},
+    {"name": "rrf_dfn_light", "constant": 10, "pe": 2.0, "siglip2": 0.5, "dfn": 0.6},
+    {"name": "rrf_aux_light", "constant": 10, "pe": 3.0, "siglip2": 0.25, "dfn": 0.5},
 ]
 
 FUSION_CONFIGS = (
-    [("legacy", value) for value in (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)]
-    + [("calibrated", value) for value in (0.25, 0.5, 1.0, 2.0)]
-    + [("rank", value) for value in (0.25, 0.5, 1.0, 2.0)]
+    [("legacy", value) for value in (2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0)]
+    + [("calibrated", value) for value in
+       (0.4, 0.5, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95,
+        1.0, 1.05, 1.1, 1.2, 1.3, 1.5, 1.75, 2.0)]
+    + [("adaptive", value) for value in (0.5, 0.75, 1.0, 1.25, 1.5)]
+    + [("rank", value) for value in (0.5, 1.0, 2.0)]
 )
+
+POSTPROCESS_CONFIGS = [
+    {"label": "rerank", "stage": "rerank", "params": {}},
+    {"label": "greedy_sca", "stage": "greedy_sca", "params": {}},
+    {"label": "gale_shapley", "stage": "gale_shapley", "params": {}},
+    *[
+        {
+            "label": f"locked_gs_m{str(margin).replace('.', 'p')}",
+            "stage": "locked_gale_shapley",
+            "params": {"lock_margin": margin},
+        }
+        for margin in (
+            0.1, 0.125, 0.15, 0.175, 0.2, 0.225, 0.25,
+            0.3, 0.35, 0.4, 0.5, 0.75, 1.0,
+        )
+    ],
+    *[
+        {
+            "label": f"consensus_locked_gs_m{str(margin).replace('.', 'p')}",
+            "stage": "locked_gale_shapley",
+            "params": {
+                "lock_margin": margin,
+                "require_component_agreement": True,
+            },
+        }
+        for margin in (
+            0.05, 0.1, 0.15, 0.2, 0.25, 0.275,
+            0.3, 0.325, 0.35, 0.4, 0.5,
+        )
+    ],
+    {
+        "label": "gs_cycle_strict",
+        "stage": "gale_shapley_cycle_rescue",
+        "params": {
+            "text_sim_threshold": 0.96, "candidate_depth": 2,
+            "max_final_penalty": 0.20, "min_retrieval_gain": 0.05,
+        },
+    },
+    {
+        "label": "gs_cycle_balanced",
+        "stage": "gale_shapley_cycle_rescue",
+        "params": {
+            "text_sim_threshold": 0.94, "candidate_depth": 3,
+            "max_final_penalty": 0.35, "min_retrieval_gain": 0.05,
+        },
+    },
+    {
+        "label": "gs_cycle_wide",
+        "stage": "gale_shapley_cycle_rescue",
+        "params": {
+            "text_sim_threshold": 0.90, "candidate_depth": 3,
+            "max_final_penalty": 0.50, "min_retrieval_gain": 0.025,
+        },
+    },
+    {
+        "label": "gs_cycle_retrieval_strong",
+        "stage": "gale_shapley_cycle_rescue",
+        "params": {
+            "text_sim_threshold": 0.94, "candidate_depth": 3,
+            "max_final_penalty": 0.50, "min_retrieval_gain": 0.10,
+        },
+    },
+]
+
+# Always postprocess the strongest K=50 discoveries even if K=100 shifts them just
+# outside the rerank-only Top-N. This prevents the two-stage search from pruning the
+# configuration whose matching method is known to work best.
+SEEDED_FINALISTS = [
+    {"retrieval": "rrf_map_candidate", "family": "calibrated", "weight": 0.7},
+    {"retrieval": "rrf_pe_2p5", "family": "legacy", "weight": 4.0},
+    {"retrieval": "rrf_map_c5", "family": "adaptive", "weight": 0.5},
+]
 
 
 def load_payload(path):
@@ -112,8 +199,32 @@ def retrieval_score_sets(cache: dict, ensemble_mode: str,
     return sets
 
 
+def contiguous_fold_metrics(ranks, folds: int = 5) -> dict[str, float | int | None]:
+    """Robustness proxy that keeps neighboring paired queries in the same fold."""
+    if ranks is None:
+        return {
+            "cv_folds": int(folds), "cv_R1_mean": None, "cv_R1_std": None,
+            "cv_R1_worst": None, "cv_mAP_mean": None, "cv_mAP_std": None,
+        }
+    values = torch.as_tensor(ranks).long()
+    chunks = [chunk for chunk in torch.tensor_split(values, int(folds)) if chunk.numel()]
+    r1 = torch.tensor([float(chunk.eq(1).float().mean()) for chunk in chunks])
+    maps = torch.tensor([float((1.0 / chunk.float()).mean()) for chunk in chunks])
+    return {
+        "cv_folds": len(chunks),
+        "cv_R1_mean": float(r1.mean()),
+        "cv_R1_std": float(r1.std(unbiased=False)),
+        "cv_R1_worst": float(r1.min()),
+        "cv_mAP_mean": float(maps.mean()),
+        "cv_mAP_std": float(maps.std(unbiased=False)),
+    }
+
+
 def metric_row(result: dict, retrieval: dict, family: str, weight: float,
-               postprocess: str, runtime_seconds: float, baseline_order=None) -> dict:
+               postprocess: str, runtime_seconds: float, baseline_order=None,
+               postprocess_label: str | None = None,
+               postprocess_params: dict | None = None) -> dict:
+    label = postprocess_label or postprocess
     metrics = result.get(postprocess, {})
     diagnostics = result.get("diagnostics", {})
     prefix = postprocess
@@ -122,8 +233,11 @@ def metric_row(result: dict, retrieval: dict, family: str, weight: float,
         diagnostics.get("transitions_vs_reference", {}),
     )
     calibration = diagnostics.get("score_calibration", {})
+    robustness = contiguous_fold_metrics(
+        result.get("ranks", {}).get(postprocess), folds=5
+    )
     return {
-        "experiment_id": experiment_id(retrieval["name"], family, weight, postprocess),
+        "experiment_id": experiment_id(retrieval["name"], family, weight, label),
         "retrieval": retrieval["name"],
         "rrf_constant": retrieval.get("constant"),
         "pe_weight": retrieval.get("pe"),
@@ -132,7 +246,9 @@ def metric_row(result: dict, retrieval: dict, family: str, weight: float,
         "fusion_family": family,
         "fusion_weight": float(weight),
         "fusion_rank_constant": result.get("rank_constant"),
-        "postprocess": postprocess,
+        "postprocess": label,
+        "postprocess_stage": postprocess,
+        "postprocess_params": json.dumps(postprocess_params or {}, sort_keys=True),
         "mAP": metrics.get("mAP"),
         "R@1": metrics.get("R@1"),
         "R@5": metrics.get("R@5"),
@@ -141,6 +257,9 @@ def metric_row(result: dict, retrieval: dict, family: str, weight: float,
         "gt_at_rank2": diagnostics.get(f"{prefix}_gt_at_rank2"),
         "top1_conflicts": diagnostics.get(f"{prefix}_top1_conflicts"),
         "reciprocal_swap_pairs": diagnostics.get(f"{prefix}_reciprocal_swap_pairs"),
+        "cycle_candidates": diagnostics.get(f"{prefix}_cycle_candidates"),
+        "cycle_swaps": diagnostics.get(f"{prefix}_cycle_swaps"),
+        "consensus_queries": diagnostics.get(f"{prefix}_consensus_queries"),
         "helped_vs_baseline": transition.get("helped"),
         "harmed_vs_baseline": transition.get("harmed"),
         "top1_changed_by_retrieval": calibration.get("top1_changed_by_stage1"),
@@ -155,6 +274,10 @@ def metric_row(result: dict, retrieval: dict, family: str, weight: float,
         "retrieval_max": calibration.get("stage1_max"),
         "retrieval_mean": calibration.get("stage1_mean"),
         "retrieval_std": calibration.get("stage1_std"),
+        "adaptive_weight_min": calibration.get("stage1_weight_min"),
+        "adaptive_weight_mean": calibration.get("stage1_weight_mean"),
+        "adaptive_weight_max": calibration.get("stage1_weight_max"),
+        **robustness,
         "runtime_seconds": round(float(runtime_seconds), 4),
     }
 
@@ -189,6 +312,25 @@ def safe_sort(rows: list[dict], r10_floor: float) -> list[dict]:
     )
 
 
+def pareto_frontier(rows: list[dict], metrics=("R@1", "mAP", "R@10")) -> list[dict]:
+    """Return non-dominated settings for the requested maximize-only metrics."""
+    valid = [row for row in rows if all(row.get(key) is not None for key in metrics)]
+    frontier = []
+    for row in valid:
+        dominated = False
+        for other in valid:
+            if other is row:
+                continue
+            at_least = all(float(other[key]) >= float(row[key]) for key in metrics)
+            strict = any(float(other[key]) > float(row[key]) for key in metrics)
+            if at_least and strict:
+                dominated = True
+                break
+        if not dominated:
+            frontier.append(row)
+    return safe_sort(frontier, r10_floor=-float("inf"))
+
+
 def write_answer(path: Path, rows: list[list[str]]):
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
@@ -198,12 +340,24 @@ def write_answer(path: Path, rows: list[list[str]]):
 def query_diagnostic_rows(cache: dict, result: dict, postprocess: str) -> list[dict]:
     order = result["orders"][postprocess]
     scores = result["scores"].get(postprocess, result["scores"]["rerank"])
+    retrieval_order = result["orders"]["retrieval"]
+    itm_order = result["orders"]["itm"]
+    rerank_order = result["orders"]["rerank"]
+    retrieval_scores = result["scores"]["retrieval"]
+    itm_scores = result["scores"]["itm"]
+    rerank_scores = result["scores"]["rerank"]
     gallery = cache["gallery_ids"]
     ranks = result.get("ranks", {}).get(postprocess)
+    retrieval_ranks = result.get("ranks", {}).get("retrieval")
+    itm_ranks = result.get("ranks", {}).get("itm")
+    rerank_ranks = result.get("ranks", {}).get("rerank")
     output = []
     for i, row in enumerate(order):
         score_row = scores[i]
         margin = float(score_row[0] - score_row[1]) if score_row.numel() > 1 else math.nan
+        retrieval_margin = float(retrieval_scores[i, 0] - retrieval_scores[i, 1])
+        itm_margin = float(itm_scores[i, 0] - itm_scores[i, 1])
+        rerank_margin = float(rerank_scores[i, 0] - rerank_scores[i, 1])
         output.append({
             "query_index": i,
             "query_id": cache.get("query_labels", cache["query_image_ids"])[i],
@@ -211,7 +365,100 @@ def query_diagnostic_rows(cache: dict, result: dict, postprocess: str) -> list[d
             "predicted_top1": gallery[int(row[0])],
             "gt_rank": int(ranks[i]) if ranks is not None else None,
             "top1_margin": margin,
+            "retrieval_top1": gallery[int(retrieval_order[i, 0])],
+            "itm_top1": gallery[int(itm_order[i, 0])],
+            "rerank_top1": gallery[int(rerank_order[i, 0])],
+            "retrieval_gt_rank": (
+                int(retrieval_ranks[i]) if retrieval_ranks is not None else None
+            ),
+            "itm_gt_rank": int(itm_ranks[i]) if itm_ranks is not None else None,
+            "rerank_gt_rank": (
+                int(rerank_ranks[i]) if rerank_ranks is not None else None
+            ),
+            "retrieval_top2_margin": retrieval_margin,
+            "itm_top2_margin": itm_margin,
+            "rerank_top2_margin": rerank_margin,
+            "retrieval_itm_agree": bool(
+                int(retrieval_order[i, 0]) == int(itm_order[i, 0])
+            ),
+            "retrieval_final_agree": bool(
+                int(retrieval_order[i, 0]) == int(row[0])
+            ),
+            "gt_in_candidates": bool(
+                int(cache["gt_pos"][i]) in set(
+                    int(value) for value in cache["candidate_indices"][i]
+                )
+            ) if cache.get("metadata", {}).get("has_ground_truth") else None,
         })
+    return output
+
+
+def summarize_failure_cases(rows: list[dict], result: dict, stage: str) -> dict:
+    ranks = [int(row["gt_rank"]) for row in rows if row.get("gt_rank") is not None]
+    misses = [row for row in rows if row.get("gt_rank") is not None and int(row["gt_rank"]) > 1]
+    rank2 = [row for row in rows if row.get("gt_rank") is not None and int(row["gt_rank"]) == 2]
+
+    def count(predicate, values):
+        return sum(bool(predicate(row)) for row in values)
+
+    def margin_summary(values):
+        margins = [float(row["top1_margin"]) for row in values if math.isfinite(float(row["top1_margin"]))]
+        return {
+            "count": len(margins),
+            "median": statistics.median(margins) if margins else None,
+            "mean": statistics.mean(margins) if margins else None,
+        }
+
+    bins = {
+        "rank1": sum(rank == 1 for rank in ranks),
+        "rank2": sum(rank == 2 for rank in ranks),
+        "rank3_5": sum(3 <= rank <= 5 for rank in ranks),
+        "rank6_10": sum(6 <= rank <= 10 for rank in ranks),
+        "rank11_50": sum(11 <= rank <= 50 for rank in ranks),
+        "above50": sum(rank > 50 for rank in ranks),
+    }
+    diagnostics = result.get("diagnostics", {})
+    output = {
+        "stage": stage,
+        "queries": len(rows),
+        "misses": len(misses),
+        "rank_bins": bins,
+        "rank2_share_of_misses": len(rank2) / len(misses) if misses else 0.0,
+        "candidate_misses": count(lambda row: not row.get("gt_in_candidates", False), rows),
+        "component_disagreement": {
+            "all_retrieval_vs_itm": count(lambda row: not row["retrieval_itm_agree"], rows),
+            "miss_retrieval_vs_itm": count(lambda row: not row["retrieval_itm_agree"], misses),
+            "rank2_retrieval_vs_itm": count(lambda row: not row["retrieval_itm_agree"], rank2),
+        },
+        "rank2_rescue_opportunities": {
+            "retrieval_already_correct": count(
+                lambda row: int(row["retrieval_gt_rank"]) == 1, rank2
+            ),
+            "itm_already_correct": count(lambda row: int(row["itm_gt_rank"]) == 1, rank2),
+            "fused_rerank_already_correct": count(
+                lambda row: int(row["rerank_gt_rank"]) == 1, rank2
+            ),
+        },
+        "margin": {
+            "correct": margin_summary([row for row in rows if int(row["gt_rank"]) == 1]),
+            "miss": margin_summary(misses),
+            "rank2": margin_summary(rank2),
+        },
+        "uncertainty_gates": {},
+        "top1_conflicts": diagnostics.get(f"{stage}_top1_conflicts"),
+        "reciprocal_swap_pairs": diagnostics.get(f"{stage}_reciprocal_swap_pairs"),
+        "cycle_candidates": diagnostics.get(f"{stage}_cycle_candidates"),
+        "cycle_swaps": diagnostics.get(f"{stage}_cycle_swaps"),
+    }
+    for threshold in (0.0, 0.1, 0.25, 0.5, 0.75, 1.0):
+        flagged = [row for row in rows if float(row["top1_margin"]) <= threshold]
+        caught = count(lambda row: int(row["gt_rank"]) > 1, flagged)
+        output["uncertainty_gates"][str(threshold)] = {
+            "flagged": len(flagged),
+            "errors_caught": caught,
+            "error_recall": caught / len(misses) if misses else 0.0,
+            "flag_precision": caught / len(flagged) if flagged else 0.0,
+        }
     return output
 
 
@@ -256,6 +503,37 @@ def make_charts(output_dir: Path, sweep_rows: list[dict], finalist_rows: list[di
     fig.savefig(output_dir / "fusion_pareto.png", dpi=170)
     plt.close(fig)
 
+    locked_rows = [
+        row for row in finalist_rows
+        if row.get("postprocess_stage") == "locked_gale_shapley"
+    ]
+    if locked_rows:
+        fig, ax = plt.subplots(figsize=(9, 5.2))
+        groups = {}
+        for row in locked_rows:
+            params = json.loads(row["postprocess_params"])
+            mode = "consensus" if params.get("require_component_agreement") else "all"
+            key = (
+                f"{row['retrieval']} | {row['fusion_family']} "
+                f"{row['fusion_weight']} | {mode}"
+            )
+            groups.setdefault(key, []).append(row)
+        for label, rows in groups.items():
+            rows = sorted(
+                rows,
+                key=lambda row: json.loads(row["postprocess_params"])["lock_margin"],
+            )
+            x_values = [json.loads(row["postprocess_params"])["lock_margin"] for row in rows]
+            ax.plot(x_values, [row["R@1"] for row in rows], marker="o", label=label)
+        ax.set_xlabel("confidence lock margin")
+        ax.set_ylabel("R@1")
+        ax.set_title("Confidence-locked Gale-Shapley sweep")
+        ax.grid(alpha=0.25)
+        ax.legend(fontsize=7)
+        fig.tight_layout()
+        fig.savefig(output_dir / "lock_margin_curves.png", dpi=170)
+        plt.close(fig)
+
     ranks = best_result.get("ranks", {}).get(best_stage)
     if ranks is not None:
         values = torch.as_tensor(ranks).long()
@@ -274,10 +552,11 @@ def make_charts(output_dir: Path, sweep_rows: list[dict], finalist_rows: list[di
         fig.savefig(output_dir / "best_gt_rank_distribution.png", dpi=170)
         plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(max(8, 2.5 * len(finalist_rows)), 4.8))
-    names = [row["experiment_id"] for row in finalist_rows]
-    helped = [row.get("helped_vs_baseline") or 0 for row in finalist_rows]
-    harmed = [row.get("harmed_vs_baseline") or 0 for row in finalist_rows]
+    chart_finalists = safe_sort(finalist_rows, r10_floor=-float("inf"))[:15]
+    fig, ax = plt.subplots(figsize=(max(10, 0.8 * len(chart_finalists)), 5.2))
+    names = [row["experiment_id"] for row in chart_finalists]
+    helped = [row.get("helped_vs_baseline") or 0 for row in chart_finalists]
+    harmed = [row.get("harmed_vs_baseline") or 0 for row in chart_finalists]
     x = torch.arange(len(names)).numpy()
     ax.bar(x - 0.2, helped, 0.4, label="helped")
     ax.bar(x + 0.2, harmed, 0.4, label="harmed")
@@ -290,16 +569,16 @@ def make_charts(output_dir: Path, sweep_rows: list[dict], finalist_rows: list[di
     plt.close(fig)
 
     metric_names = ("mAP", "R@1", "R@5", "R@10")
-    fig, ax = plt.subplots(figsize=(max(11, 1.6 * len(finalist_rows)), 5.5))
-    x = torch.arange(len(finalist_rows)).numpy()
+    fig, ax = plt.subplots(figsize=(max(11, 0.9 * len(chart_finalists)), 5.8))
+    x = torch.arange(len(chart_finalists)).numpy()
     width = 0.2
     for metric_index, metric in enumerate(metric_names):
         offset = (metric_index - 1.5) * width
-        values = [row[metric] for row in finalist_rows]
+        values = [row[metric] for row in chart_finalists]
         ax.bar(x + offset, values, width, label=metric)
     ax.set_xticks(x)
     ax.set_xticklabels(
-        [row["experiment_id"] for row in finalist_rows],
+        [row["experiment_id"] for row in chart_finalists],
         rotation=25, ha="right", fontsize=8,
     )
     ax.set_ylim(0, 1.05)
@@ -363,54 +642,124 @@ def run_oldtest(args, cache: dict, retrieval_sets: list[dict]):
     write_csv(output_dir / "fusion_sweep.csv", sweep_rows)
 
     finalists = safe_sort(sweep_rows, r10_floor)[:int(args.finalists)]
+    finalist_ids = {row["experiment_id"] for row in finalists}
+    for seed in SEEDED_FINALISTS:
+        match = next((
+            row for row in sweep_rows
+            if row["retrieval"] == seed["retrieval"]
+            and row["fusion_family"] == seed["family"]
+            and float(row["fusion_weight"]) == float(seed["weight"])
+        ), None)
+        if match is not None and match["experiment_id"] not in finalist_ids:
+            finalists.append(match)
+            finalist_ids.add(match["experiment_id"])
     retrieval_by_name = {item["name"]: item for item in retrieval_sets}
-    finalist_rows, finalist_results = [], {}
+    finalist_rows, finalist_specs = [], {}
     for finalist in finalists:
         retrieval = retrieval_by_name.get(finalist["retrieval"], baseline_retrieval)
-        started = time.perf_counter()
-        result = evaluate_cached_rerank(
-            cache, retrieval["scores"], finalist["fusion_family"],
-            float(finalist["fusion_weight"]),
-            postprocesses=("rerank", "greedy_sca", "gale_shapley"),
-            reference_order=baseline_order,
-        )
-        elapsed = time.perf_counter() - started
-        for stage in ("rerank", "greedy_sca", "gale_shapley"):
+        for post_cfg in POSTPROCESS_CONFIGS:
+            stage = post_cfg["stage"]
+            label = post_cfg["label"]
+            params = dict(post_cfg["params"])
+            started = time.perf_counter()
+            result = evaluate_cached_rerank(
+                cache, retrieval["scores"], finalist["fusion_family"],
+                float(finalist["fusion_weight"]),
+                postprocesses=(stage,), postprocess_options=params,
+                reference_order=baseline_order,
+                include_top10=False,
+            )
+            elapsed = time.perf_counter() - started
             row = add_resource_context(metric_row(
                 result, retrieval, finalist["fusion_family"],
                 float(finalist["fusion_weight"]), stage, elapsed,
+                postprocess_label=label, postprocess_params=params,
             ), args, cache)
             finalist_rows.append(row)
-            finalist_results[row["experiment_id"]] = (result, stage)
-            write_answer(
-                output_dir / f"answer_{row['experiment_id']}.txt",
-                result["top10_by_stage"][stage],
-            )
-            write_csv(
-                output_dir / f"queries_{row['experiment_id']}.csv",
-                query_diagnostic_rows(cache, result, stage),
+            finalist_specs[row["experiment_id"]] = (
+                retrieval, finalist["fusion_family"],
+                float(finalist["fusion_weight"]), stage, params, label,
             )
     write_csv(output_dir / "finalist_results.csv", finalist_rows)
+    write_csv(output_dir / "pareto_settings.csv", pareto_frontier(finalist_rows))
 
     best_row = safe_sort(finalist_rows, r10_floor)[0]
-    best_result, best_stage = finalist_results[best_row["experiment_id"]]
-    best_retrieval = retrieval_by_name.get(best_row["retrieval"], baseline_retrieval)
-    best_config = {
-        "selection_policy": "R@1, then mAP, then R@10",
-        "r10_floor": r10_floor,
-        "topk": int(cache["metadata"]["topk"]),
-        "candidate_hash": cache["metadata"]["candidate_hash"],
-        "retrieval": {key: best_retrieval.get(key) for key in
-                      ("name", "constant", "pe", "siglip2", "dfn")},
-        "fusion_family": best_row["fusion_family"],
-        "fusion_weight": float(best_row["fusion_weight"]),
-        "postprocess": best_stage,
-        "metrics": {key: best_row[key] for key in ("mAP", "R@1", "R@5", "R@10", "R@50")},
-    }
+    def evaluate_spec(row):
+        retrieval, family, weight, stage, params, label = finalist_specs[
+            row["experiment_id"]
+        ]
+        result = evaluate_cached_rerank(
+            cache, retrieval["scores"], family, weight,
+            postprocesses=(stage,), postprocess_options=params,
+            reference_order=baseline_order,
+        )
+        return result, stage, params, label
+
+    best_result, best_stage, best_postprocess_params, best_postprocess_label = (
+        evaluate_spec(best_row)
+    )
+    def make_config(row, stage, params, label, floor, policy):
+        retrieval = retrieval_by_name.get(row["retrieval"], baseline_retrieval)
+        return {
+            "selection_policy": policy,
+            "r10_floor": floor,
+            "topk": int(cache["metadata"]["topk"]),
+            "candidate_hash": cache["metadata"]["candidate_hash"],
+            "retrieval": {key: retrieval.get(key) for key in
+                          ("name", "constant", "pe", "siglip2", "dfn")},
+            "fusion_family": row["fusion_family"],
+            "fusion_weight": float(row["fusion_weight"]),
+            "postprocess": stage,
+            "postprocess_label": label,
+            "postprocess_params": params,
+            "metrics": {key: row[key] for key in ("mAP", "R@1", "R@5", "R@10", "R@50")},
+        }
+
+    best_config = make_config(
+        best_row, best_stage, best_postprocess_params, best_postprocess_label,
+        r10_floor, "R@1, then mAP, then R@10",
+    )
     save_json(output_dir / "best_inference_config.json", best_config)
     torch.save({"result": best_result, "stage": best_stage, "config": best_config},
                output_dir / "best_result.pt")
     write_answer(output_dir / "answer.txt", best_result["top10_by_stage"][best_stage])
+
+    peak_r10 = max(float(row["R@10"]) for row in finalist_rows)
+    conservative_floor = peak_r10 - float(args.r10_tolerance)
+    conservative_row = safe_sort(finalist_rows, conservative_floor)[0]
+    if conservative_row["experiment_id"] == best_row["experiment_id"]:
+        conservative_result = best_result
+        conservative_stage = best_stage
+        conservative_params = best_postprocess_params
+        conservative_label = best_postprocess_label
+    else:
+        conservative_result, conservative_stage, conservative_params, conservative_label = (
+            evaluate_spec(conservative_row)
+        )
+    conservative_config = make_config(
+        conservative_row, conservative_stage, conservative_params, conservative_label,
+        conservative_floor,
+        "R@1 with R@10 within tolerance of the best finalist R@10",
+    )
+    save_json(output_dir / "best_conservative_config.json", conservative_config)
+    write_answer(
+        output_dir / "answer_conservative.txt",
+        conservative_result["top10_by_stage"][conservative_stage],
+    )
+    write_csv(
+        output_dir / "best_conservative_queries.csv",
+        query_diagnostic_rows(cache, conservative_result, conservative_stage),
+    )
+    best_query_rows = query_diagnostic_rows(cache, best_result, best_stage)
+    write_csv(output_dir / "best_queries.csv", best_query_rows)
+    write_csv(
+        output_dir / "best_rank2_cases.csv",
+        [row for row in best_query_rows if int(row["gt_rank"]) == 2],
+    )
+    failure_analysis = summarize_failure_cases(
+        best_query_rows, best_result, best_stage
+    )
+    save_json(output_dir / "failure_analysis.json", failure_analysis)
     make_charts(output_dir, sweep_rows, finalist_rows, best_result, best_stage)
 
     metrics = {
@@ -420,6 +769,8 @@ def run_oldtest(args, cache: dict, retrieval_sets: list[dict]):
         "baseline": baseline_row,
         "r10_floor": r10_floor,
         "best": best_row,
+        "best_conservative": conservative_row,
+        "conservative_r10_floor": conservative_floor,
         "best_delta_vs_pe_itm": {
             key: float(best_row[key]) - float(baseline_row[key])
             for key in ("mAP", "R@1", "R@5", "R@10", "R@50")
@@ -427,6 +778,18 @@ def run_oldtest(args, cache: dict, retrieval_sets: list[dict]):
         "top_rerank_settings": safe_sort(sweep_rows, r10_floor)[:10],
         "finalists": finalist_rows,
         "retrieval_screen": retrieval_rows,
+        "failure_analysis": failure_analysis,
+        "search_space": {
+            "retrieval_configs": [
+                {key: value for key, value in item.items() if key != "scores"}
+                for item in retrieval_sets
+            ],
+            "fusion_configs": [
+                {"family": family, "weight": weight}
+                for family, weight in FUSION_CONFIGS
+            ],
+            "postprocess_configs": POSTPROCESS_CONFIGS,
+        },
         "resource": {
             "max_rss_mib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
             "itm_cache_preparation_seconds": cache["metadata"].get("preparation_seconds"),
@@ -473,6 +836,7 @@ def run_official(args, cache: dict, retrieval_sets: list[dict]):
         cache, retrieval["scores"], config["fusion_family"],
         float(config["fusion_weight"]),
         postprocesses=(config["postprocess"],),
+        postprocess_options=config.get("postprocess_params") or {},
     )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

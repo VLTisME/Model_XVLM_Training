@@ -50,3 +50,30 @@ def test_safe_sort_uses_r1_then_map_then_r10_and_safety_floor():
     ]
     ranked = sweep.safe_sort(rows, r10_floor=0.98)
     assert [row["name"] for row in ranked] == ["r1", "map"]
+
+
+def test_extended_sweep_covers_adaptive_and_failure_targeted_postprocessing():
+    sweep = load_sweep_module()
+    assert ("adaptive", 1.0) in sweep.FUSION_CONFIGS
+    assert any(item["name"] == "rrf_map_c5" for item in sweep.RETRIEVAL_CONFIGS)
+    stages = {item["stage"] for item in sweep.POSTPROCESS_CONFIGS}
+    assert "locked_gale_shapley" in stages
+    assert "gale_shapley_cycle_rescue" in stages
+    assert any(
+        item["params"].get("require_component_agreement")
+        for item in sweep.POSTPROCESS_CONFIGS
+    )
+    assert any(
+        item["retrieval"] == "rrf_pe_2p5"
+        and item["family"] == "legacy"
+        and item["weight"] == 4.0
+        for item in sweep.SEEDED_FINALISTS
+    )
+
+
+def test_contiguous_fold_metrics_are_finite():
+    sweep = load_sweep_module()
+    report = sweep.contiguous_fold_metrics(torch.tensor([1, 2, 1, 3, 1]), folds=3)
+    assert report["cv_folds"] == 3
+    assert 0.0 <= report["cv_R1_worst"] <= report["cv_R1_mean"] <= 1.0
+    assert report["cv_R1_std"] >= 0.0

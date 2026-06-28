@@ -1,8 +1,17 @@
 """Inference pipeline math: stage-1 ranks, rerank rank bookkeeping, Gale-Shapley, pairwise/RRF."""
 import torch
 
-from star.inference import (apply_gale_shapley, gale_shapley_match, pairwise_rerank,
-                            ranks_after_rerank, report_from_ranks, rrf_fuse, stage1_ranks)
+from star.inference import (
+    apply_gale_shapley,
+    confidence_locked_gale_shapley,
+    gale_shapley_match,
+    pairwise_rerank,
+    ranks_after_rerank,
+    report_from_ranks,
+    retrieval_guided_cycle_rescue,
+    rrf_fuse,
+    stage1_ranks,
+)
 
 
 def test_stage1_ranks_basic_and_ties():
@@ -36,6 +45,38 @@ def test_gale_shapley_resolves_conflict():
                            [0.9, 0.2, 0.1]])
     matched = gale_shapley_match(order, scores)
     assert matched.tolist() == [2, 7]
+
+
+def test_confidence_locked_gale_shapley_protects_decisive_claim():
+    order = torch.tensor([[7, 2, 5],
+                          [7, 5, 2]])
+    scores = torch.tensor([[0.90, 0.89, 0.10],
+                           [0.80, 0.10, 0.00]])
+    assert gale_shapley_match(order, scores).tolist() == [7, 5]
+    matched = confidence_locked_gale_shapley(order, scores, min_margin=0.5)
+    assert matched.tolist() == [2, 7]
+    consensus_matched = confidence_locked_gale_shapley(
+        order, scores, min_margin=0.5,
+        lock_mask=torch.tensor([True, False]),
+    )
+    assert consensus_matched.tolist() == [7, 5]
+
+
+def test_retrieval_guided_cycle_rescue_swaps_crossed_pair():
+    order = torch.tensor([[10, 11, 12],
+                          [11, 10, 13]])
+    final = torch.tensor([[1.0, 0.9, 0.0],
+                          [1.0, 0.9, 0.0]])
+    retrieval = torch.tensor([[0.1, 1.0, 0.0],
+                              [0.1, 1.0, 0.0]])
+    query_feats = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
+    rescued, diagnostics = retrieval_guided_cycle_rescue(
+        order, final, retrieval, query_feats,
+        text_sim_threshold=0.9, candidate_depth=2,
+        max_final_penalty=0.25, min_retrieval_gain=0.1,
+    )
+    assert rescued[:, 0].tolist() == [11, 10]
+    assert diagnostics["cycle_swaps"] == 1
 
 
 def test_apply_gale_shapley_rank_updates():
@@ -246,7 +287,7 @@ def test_cached_rerank_fusion_families_are_cpu_only_and_finite():
         "gt_pos": torch.tensor([0, 1]),
         "fallback_ranks": torch.ones(2, dtype=torch.long),
     }
-    for family in ("legacy", "calibrated", "rank"):
+    for family in ("legacy", "calibrated", "adaptive", "rank"):
         result = evaluate_cached_rerank(
             cache, cache["pe_scores"], fusion_family=family,
             fusion_weight=1.0, postprocesses=("rerank",),
